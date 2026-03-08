@@ -3,14 +3,9 @@ set -euo pipefail
 
 # Deploy script for Massive Platformer
 #
-# Prerequisites:
-#   - Docker running
-#   - wrangler authenticated (wrangler login)
-#   - CALLS_APP_ID and CALLS_APP_TOKEN set in wrangler.toml [vars]
-#
 # Usage:
-#   ./deploy.sh          # Deploy everything
-#   ./deploy.sh --skip-container  # Deploy only Worker + assets (no container rebuild)
+#   ./deploy.sh                   # Full deploy (container + worker)
+#   ./deploy.sh --skip-container  # Worker + assets only
 
 SKIP_CONTAINER=false
 if [[ "${1:-}" == "--skip-container" ]]; then
@@ -21,32 +16,19 @@ echo "=== Deploying Massive Platformer ==="
 
 if [[ "$SKIP_CONTAINER" == false ]]; then
     echo ""
-    echo "--- Building container image (no cache) ---"
-    # Wrangler's Docker cache is aggressive and often serves stale images.
-    # We build with --no-cache, push manually, then point wrangler at the tag.
-    cd container
-    TAG="deploy-$(date +%s)"
-    docker build --no-cache -t "massive-platformer:$TAG" .
+    echo "--- Building container ---"
 
-    echo ""
-    echo "--- Pushing to Cloudflare registry ---"
-    # Get account ID from wrangler
-    ACCOUNT_ID=$(cd .. && npx wrangler whoami 2>/dev/null | grep -oP '[a-f0-9]{32}' | head -1)
-    REGISTRY="registry.cloudflare.com/${ACCOUNT_ID}/massive-platformer-gamecontainer"
+    # Bust Docker cache by injecting a unique build arg
+    CACHE_BUST=$(date +%s)
+    sed -i '/^ARG CACHE_BUST/d' container/Dockerfile
+    sed -i "1a ARG CACHE_BUST=$CACHE_BUST" container/Dockerfile
 
-    # Wrangler handles registry auth during deploy, but for manual push we need to login
-    # This reuses the credentials wrangler stores
-    docker tag "massive-platformer:$TAG" "$REGISTRY:$TAG"
-    docker push "$REGISTRY:$TAG"
-
-    cd ..
-    echo ""
-    echo "--- Updating wrangler.toml with new image tag ---"
-    sed -i "s|image = \".*\"|image = \"$REGISTRY:$TAG\"|" wrangler.toml
+    # Use wrangler's Dockerfile path so it handles registry auth automatically
+    # (Docker registry tokens expire quickly — wrangler refreshes them on each deploy)
+    sed -i 's|image = "registry.*"|image = "./container/Dockerfile"|' wrangler.toml
 
     echo ""
     echo "--- Bumping DO name for fresh container instance ---"
-    # Container DOs are sticky to old images. Changing the name forces a fresh instance.
     CURRENT=$(grep -oP 'game-world-v\K\d+' src/worker.ts)
     NEXT=$((CURRENT + 1))
     sed -i "s/game-world-v${CURRENT}/game-world-v${NEXT}/" src/worker.ts
@@ -54,14 +36,16 @@ if [[ "$SKIP_CONTAINER" == false ]]; then
 fi
 
 echo ""
-echo "--- Deploying Worker + assets ---"
+echo "--- Deploying ---"
 npx wrangler deploy
 
 if [[ "$SKIP_CONTAINER" == false ]]; then
-    # Restore wrangler.toml to use Dockerfile path for git cleanliness
-    sed -i 's|image = "registry.*"|image = "./container/Dockerfile"|' wrangler.toml
+    # Clean up the cache bust arg
+    sed -i '/^ARG CACHE_BUST/d' container/Dockerfile
 fi
 
 echo ""
 echo "=== Deploy complete ==="
 echo "Live at: https://massive-platformer.makeshifted.workers.dev"
+echo ""
+echo "Note: Container cold start takes ~10-20 seconds on first request."

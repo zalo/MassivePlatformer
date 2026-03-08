@@ -159,12 +159,11 @@ CALLS_APP_ID="..." CALLS_APP_TOKEN="..." node src/server.js
 ```
 
 The deploy script handles the full pipeline:
-1. Builds the container image with `--no-cache` (wrangler's Docker cache is aggressive and often serves stale images)
-2. Pushes to Cloudflare's container registry
-3. Updates `wrangler.toml` with the new image tag
-4. Bumps the DO instance name (container DOs are sticky to old images — changing the name forces a fresh instance)
-5. Runs `wrangler deploy`
-6. Restores `wrangler.toml` to use the Dockerfile path for git cleanliness
+1. Injects a cache-bust ARG into the Dockerfile (wrangler's Docker cache is aggressive)
+2. Uses wrangler's Dockerfile path so it handles registry auth automatically (Docker registry tokens expire quickly)
+3. Bumps the DO instance name (container DOs are sticky to old images — changing the name forces a fresh instance)
+4. Runs `wrangler deploy` (builds, pushes, deploys in one step)
+5. Cleans up the cache-bust ARG
 
 ## Project structure
 
@@ -187,12 +186,20 @@ The deploy script handles the full pipeline:
 └── README.md
 ```
 
+## Security: Calls API token
+
+Cloudflare's Realtime SFU API uses a single app-level bearer token for all operations — session creation, track management, data channels. There are no scoped or per-session tokens. Cloudflare's [recommended architecture](https://developers.cloudflare.com/realtime/sfu/https-api/) is three-tier: clients call your backend, your backend calls the Calls API with the token.
+
+This project proxies all Calls API requests through the game server (`/api/calls/*`), keeping the token server-side. The client never sees the token. The proxy adds one HTTP hop per API call, which is acceptable since API calls only happen during join (not during gameplay — data flows over WebRTC after setup).
+
+The proxy approach also lets the server validate and rate-limit requests — for example, ensuring a client can only create one session, or only subscribe to the game-state channel.
+
 ## Key technical discoveries
 
 **Cloudflare Calls API quirks:**
 - `/sessions/new` without a body creates a session; with `sessionDescription` it creates + exchanges SDP in one call
 - `/datachannels/establish` does not work — use `/sessions/new` with SDP or `/tracks/new` with `autoDiscover: true`
-- Subscribe + `createDataChannel({negotiated: true})` must happen atomically in the same microtask, or the subscription stays inactive
+- Subscribe + `createDataChannel({negotiated: true})` must happen atomically in the same microtask, or the subscription stays inactive (confirmed with node-datachannel; browser behavior may differ)
 
 **Cloudflare Containers:**
 - Run on Firecracker microVMs — full Linux kernel, native addons work

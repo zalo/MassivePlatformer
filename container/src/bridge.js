@@ -13,6 +13,8 @@ class Bridge {
 		this.playerInputChannels = new Map();
 		// playerId -> input state
 		this.playerInputs = new Map();
+		// playerId -> timestamp of last received input
+		this.playerLastInput = new Map();
 	}
 
 	async init() {
@@ -169,6 +171,7 @@ class Bridge {
 			this.playerInputChannels.delete(playerId);
 		}
 		this.playerInputs.delete(playerId);
+		this.playerLastInput.delete(playerId);
 	}
 
 	broadcastState(buffer) {
@@ -187,6 +190,10 @@ class Bridge {
 		return this.playerInputs.get(playerId) || 0;
 	}
 
+	getLastInputTime(playerId) {
+		return this.playerLastInput.get(playerId) || 0;
+	}
+
 	_processInput(playerId, msg) {
 		// Input is a single byte: bit flags for keys
 		// bit 0: left, bit 1: right, bit 2: jump
@@ -195,6 +202,7 @@ class Bridge {
 		} else if (typeof msg === "string") {
 			this.playerInputs.set(playerId, msg.charCodeAt(0));
 		}
+		this.playerLastInput.set(playerId, Date.now());
 	}
 
 	_handleIncomingChannel(dc) {

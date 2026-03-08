@@ -27,6 +27,7 @@ const CALLS_APP_TOKEN = process.env.CALLS_APP_TOKEN;
 const CALLS_API = `https://rtc.live.cloudflare.com/v1/apps/${CALLS_APP_ID}`;
 const PORT = 8080;
 const TICK_RATE = 45; // Hz (3x the 15hz network rate)
+const PLAYER_TIMEOUT_MS = 60 * 1000; // Remove players after 60 seconds of no input
 
 if (!CALLS_APP_ID || !CALLS_APP_TOKEN) {
 	console.error("Missing CALLS_APP_ID or CALLS_APP_TOKEN — running in degraded mode");
@@ -38,7 +39,7 @@ const bridge = bridgeAvailable ? new Bridge(CALLS_API, CALLS_APP_TOKEN) : null;
 let bridgeReady = false;
 let nextPlayerId = 1;
 
-// Map of playerId -> { sessionId, inputChannelName }
+// Map of playerId -> { sessionId, inputChannelName, lastInputTime }
 const players = new Map();
 
 // --- Initialize bridge session ---
@@ -49,11 +50,27 @@ async function initBridge() {
 	console.log(`Bridge session created: ${bridge.sessionId}`);
 }
 
-// --- Physics tick (50hz) ---
+// --- Physics tick (45hz) ---
 setInterval(() => {
 	if (!bridgeReady) return;
 	world.tick(1 / TICK_RATE);
 }, 1000 / TICK_RATE);
+
+// --- Player timeout sweep (every 10 seconds) ---
+setInterval(() => {
+	if (!bridge) return;
+	const now = Date.now();
+	for (const [playerId, player] of players) {
+		const lastInput = bridge.getLastInputTime(playerId);
+		// Only timeout players who have registered (lastInput > 0) and gone silent
+		if (lastInput > 0 && (now - lastInput) > PLAYER_TIMEOUT_MS) {
+			console.log(`Player ${playerId} timed out (no input for ${Math.round((now - lastInput) / 1000)}s)`);
+			world.removePlayer(playerId);
+			bridge.unsubscribePlayer(playerId);
+			players.delete(playerId);
+		}
+	}
+}, 10000);
 
 // --- Network broadcast (15hz, decoupled from physics) ---
 // Packet format:
@@ -158,6 +175,8 @@ const server = http.createServer(async (req, res) => {
 	try {
 		if (req.method === "GET" && req.url === "/api/config") {
 			await handleConfig(req, res);
+		} else if (req.method === "POST" && req.url.startsWith("/api/calls/")) {
+			await handleCallsProxy(req, res);
 		} else if (req.method === "POST" && req.url === "/api/register") {
 			await handleRegister(req, res);
 		} else if (req.method === "POST" && req.url === "/api/leave") {
@@ -191,8 +210,7 @@ const server = http.createServer(async (req, res) => {
 	}
 });
 
-// Returns connection config (Calls API info, bridge session, map)
-// Client handles its own session creation and channel setup atomically.
+// Returns connection config. Token is NOT exposed — client uses /api/calls/ proxy.
 async function handleConfig(req, res) {
 	if (!bridgeReady) {
 		res.writeHead(503);
@@ -208,12 +226,35 @@ async function handleConfig(req, res) {
 		JSON.stringify({
 			playerId,
 			inputChannelName,
-			callsApi: CALLS_API,
-			callsToken: CALLS_APP_TOKEN,
 			bridgeSessionId: bridge.sessionId,
 			map: MAP,
 		})
 	);
+}
+
+// Proxy Calls API requests — keeps the token server-side.
+// Client sends: POST /api/calls/sessions/new  (body forwarded as-is)
+// Server adds auth header and forwards to Cloudflare Calls API.
+async function handleCallsProxy(req, res) {
+	const callsPath = req.url.replace("/api/calls", "");
+	const body = await readBody(req);
+
+	const opts = {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${CALLS_APP_TOKEN}`,
+		},
+	};
+	if (body) {
+		opts.headers["Content-Type"] = "application/json";
+		opts.body = body; // Forward raw body
+	}
+
+	const resp = await fetch(`${CALLS_API}${callsPath}`, opts);
+	const data = await resp.text();
+
+	res.writeHead(resp.status, { "Content-Type": "application/json" });
+	res.end(data);
 }
 
 // Client calls this AFTER connecting and setting up channels

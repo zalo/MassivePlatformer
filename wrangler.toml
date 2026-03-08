@@ -21,5 +21,3 @@ new_sqlite_classes = ["GameContainer"]
 [vars]
 CALLS_APP_ID = ""
 CALLS_APP_TOKEN = ""
-# Set these to your Cloudflare Calls app credentials
-# Get them from https://dash.cloudflare.com/?to=/:account/calls
