@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+*.log
+.dev.vars
+container/test-*.js
+container/src/healthcheck.js

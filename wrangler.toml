@@ -1,0 +1,25 @@
+name = "massive-platformer"
+main = "src/worker.ts"
+compatibility_date = "2025-01-01"
+
+[assets]
+directory = "public"
+
+[[containers]]
+class_name = "GameContainer"
+image = "./container/Dockerfile"
+max_instances = 5
+
+[[durable_objects.bindings]]
+name = "GAME_CONTAINER"
+class_name = "GameContainer"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GameContainer"]
+
+[vars]
+CALLS_APP_ID = ""
+CALLS_APP_TOKEN = ""
+# Set these to your Cloudflare Calls app credentials
+# Get them from https://dash.cloudflare.com/?to=/:account/calls
