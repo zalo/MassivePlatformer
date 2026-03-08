@@ -34,7 +34,7 @@ export default {
 		const url = new URL(request.url);
 
 		if (url.pathname.startsWith("/api/")) {
-			const id = env.GAME_CONTAINER.idFromName("game-world-v9");
+			const id = env.GAME_CONTAINER.idFromName("game-world-v10");
 			const container = env.GAME_CONTAINER.get(id) as DurableObjectStub<GameContainer>;
 			return container.fetch(request);
 		}

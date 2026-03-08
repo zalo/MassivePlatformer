@@ -26,7 +26,7 @@ const CALLS_APP_ID = process.env.CALLS_APP_ID;
 const CALLS_APP_TOKEN = process.env.CALLS_APP_TOKEN;
 const CALLS_API = `https://rtc.live.cloudflare.com/v1/apps/${CALLS_APP_ID}`;
 const PORT = 8080;
-const TICK_RATE = 50; // Hz
+const TICK_RATE = 45; // Hz (3x the 15hz network rate)
 
 if (!CALLS_APP_ID || !CALLS_APP_TOKEN) {
 	console.error("Missing CALLS_APP_ID or CALLS_APP_TOKEN — running in degraded mode");
@@ -49,13 +49,20 @@ async function initBridge() {
 	console.log(`Bridge session created: ${bridge.sessionId}`);
 }
 
-// --- Delta-compressed state broadcasting ---
+// --- Physics tick (50hz) ---
+setInterval(() => {
+	if (!bridgeReady) return;
+	world.tick(1 / TICK_RATE);
+}, 1000 / TICK_RATE);
+
+// --- Network broadcast (15hz, decoupled from physics) ---
 // Packet format:
 //   [type:u8, count:u16, ...players[id:u16, x:f32, y:f32, flags:u8]]
 // type 0 = full snapshot (all players), type 1 = delta (only changed/removed)
 // flags: bit 0 = grounded, bit 1 = removed (player left)
+const NET_RATE = 15; // Hz
 const PLAYER_SIZE = 11; // 2+4+4+1
-const FULL_SNAPSHOT_INTERVAL = 50; // Full snapshot every N ticks (~1 sec at 50hz)
+const FULL_SNAPSHOT_INTERVAL = 3 * NET_RATE; // Full snapshot every 3 seconds
 const POSITION_THRESHOLD = 0.3; // Min change in px to include in delta
 
 const lastSentState = new Map(); // playerId -> { x, y, flags }
@@ -64,8 +71,6 @@ let debugCounter = 0;
 
 setInterval(() => {
 	if (!bridgeReady) return;
-
-	world.tick(1 / TICK_RATE);
 
 	const playerList = world.getPlayers();
 	const isFull =
@@ -130,12 +135,12 @@ setInterval(() => {
 	}
 
 	const sent = bridge.broadcastState(buf.subarray(0, offset));
-	if (playerList.length > 0 && debugCounter++ % 50 === 0) {
+	if (playerList.length > 0 && debugCounter++ % NET_RATE === 0) {
 		console.log(
-			`Tick: ${playerList.length} players, ${offset}B ${isFull ? "FULL" : "delta(" + toSend.length + " changed)"}, sent: ${sent}`
+			`Net: ${playerList.length} players, ${offset}B ${isFull ? "FULL" : "delta(" + toSend.length + " changed)"}, sent: ${sent}`
 		);
 	}
-}, 1000 / TICK_RATE);
+}, 1000 / NET_RATE);
 
 // --- HTTP server ---
 const server = http.createServer(async (req, res) => {

@@ -37,9 +37,9 @@ A massively multiplayer 2D side-scrolling platformer where hundreds of players a
 
 2. **Input flows up**: Player keyboard/touch input (1 byte) travels through an unreliable WebRTC data channel to the SFU, which forwards it to the bridge's subscription.
 
-3. **Physics runs centrally**: The game server in the Cloudflare Container runs server-authoritative physics at 50hz — gravity, movement, platform collision for every player.
+3. **Physics runs centrally**: The game server in the Cloudflare Container runs server-authoritative physics at 45hz — gravity, movement, platform collision for every player.
 
-4. **State fans out**: The bridge publishes a compact binary state update on a single data channel. The SFU's cascading tree architecture replicates it to every connected player. The bridge sends one copy; the SFU handles thousands.
+4. **State fans out at 15hz**: The bridge publishes delta-compressed state updates on a single data channel 15 times per second (with full snapshots every 3 seconds for loss recovery). The SFU's cascading tree architecture replicates each update to every connected player. The bridge sends one copy; the SFU handles thousands.
 
 ### Why this architecture
 
@@ -65,7 +65,7 @@ This is where it gets interesting. The architecture inverts the typical cost mod
 
 | Component | Cost driver | Scaling behavior |
 |-----------|------------|------------------|
-| Container | CPU time at 50hz | ~Fixed regardless of player count |
+| Container | CPU time at 45hz | ~Fixed regardless of player count |
 | SFU ingress | Bridge → SFU (1 stream) | Free (Cloudflare doesn't charge ingress) |
 | SFU egress | SFU → all players | Linear with player count, but per-byte |
 | Calls API | Session management | Only at join/leave, not during gameplay |
@@ -104,8 +104,8 @@ Only sent when input state changes. 1 byte per input event.
 ```
 [type:u8] [count:u16] [..players]
 
-type 0 = full snapshot (all players, sent every ~1 second)
-type 1 = delta (only changed players since last tick)
+type 0 = full snapshot (all players, sent every 3 seconds)
+type 1 = delta (only changed players since last broadcast)
 
 Per player entry (11 bytes):
   [id:u16] [x:f32] [y:f32] [flags:u8]
@@ -115,7 +115,7 @@ flags:
   bit 1 = removed (player disconnected)
 ```
 
-Full snapshots ensure clients recover from packet loss. Delta ticks only include players whose position changed by more than 0.3px since last sent. Stationary players cost zero bandwidth between snapshots.
+Physics runs at 45hz server-side (3x the network rate). Network broadcasts are decoupled at 15hz — exactly one broadcast every 3 physics ticks. Full snapshots every 3 seconds ensure clients recover from packet loss. Delta ticks only include players whose position changed by more than 0.3px since last broadcast. Stationary players cost zero bandwidth between snapshots.
 
 ## Setup
 
@@ -151,19 +151,20 @@ CALLS_APP_ID="..." CALLS_APP_TOKEN="..." node src/server.js
 ### Deploy to Cloudflare
 
 ```bash
-# Build and push container image
-cd container
-docker build --no-cache -t game-server .
-REGISTRY="registry.cloudflare.com/<account-id>/massive-platformer-gamecontainer"
-TAG="v$(date +%s)"
-docker tag game-server "$REGISTRY:$TAG"
-docker push "$REGISTRY:$TAG"
+# Full deploy (builds container, pushes to registry, deploys Worker)
+./deploy.sh
 
-# Update wrangler.toml with the image tag, then deploy
-wrangler deploy
+# Deploy only Worker + static assets (skip container rebuild)
+./deploy.sh --skip-container
 ```
 
-Note: After deploying a new container image, bump the DO name in `src/worker.ts` to ensure a fresh container instance picks up the new image.
+The deploy script handles the full pipeline:
+1. Builds the container image with `--no-cache` (wrangler's Docker cache is aggressive and often serves stale images)
+2. Pushes to Cloudflare's container registry
+3. Updates `wrangler.toml` with the new image tag
+4. Bumps the DO instance name (container DOs are sticky to old images — changing the name forces a fresh instance)
+5. Runs `wrangler deploy`
+6. Restores `wrangler.toml` to use the Dockerfile path for git cleanliness
 
 ## Project structure
 
@@ -182,6 +183,7 @@ Note: After deploying a new container image, bump the DO name in `src/worker.ts`
 │   ├── index.html             # Game shell + touch controls
 │   └── game.js                # Client (Canvas + WebRTC)
 ├── wrangler.toml              # Cloudflare deployment config
+├── deploy.sh                  # Build, push, deploy pipeline
 └── README.md
 ```
 
