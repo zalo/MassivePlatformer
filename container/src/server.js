@@ -1,6 +1,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 // Test if node-datachannel loads
 let Bridge, bridgeAvailable = false;
@@ -15,6 +16,15 @@ try {
 const { GameWorld } = require("./physics");
 const { MAP } = require("./map");
 const { RelayTree } = require("./relay-tree");
+
+// --- Packet signing ---
+// Ed25519 key pair for signing state packets. Prevents relay nodes from spoofing.
+// The public key is sent to clients in /api/config so they can verify.
+const { publicKey: SIGN_PUBLIC, privateKey: SIGN_PRIVATE } =
+	crypto.generateKeyPairSync("ed25519");
+const SIGN_PUBLIC_RAW = SIGN_PUBLIC.export({ type: "spki", format: "der" });
+// Ed25519 signatures are 64 bytes
+const SIG_SIZE = 64;
 
 const MIME_TYPES = {
 	".html": "text/html",
@@ -74,13 +84,20 @@ setInterval(() => {
 }, 10000);
 
 // --- Network broadcast (15hz) ---
+// Packet format:
+//   [type:u8, seq:u8, count:u16, ...players(id:u16, x:f32, y:f32, flags:u8), signature:64B]
+// type 0 = full snapshot (resets seq to 0), type 1 = delta
+// seq = 0-255, wraps. Reset to 0 on each full snapshot.
+// Signature: Ed25519 over the payload (everything before the signature).
 const NET_RATE = 15;
 const PLAYER_SIZE = 11;
+const HEADER_SIZE = 4; // type(1) + seq(1) + count(2)
 const FULL_SNAPSHOT_INTERVAL = 3 * NET_RATE;
 const POSITION_THRESHOLD = 0.3;
 
 const lastSentState = new Map();
 let ticksSinceFullSnapshot = 0;
+let seqNumber = 0;
 let debugCounter = 0;
 
 setInterval(() => {
@@ -90,7 +107,14 @@ setInterval(() => {
 	const isFull =
 		ticksSinceFullSnapshot >= FULL_SNAPSHOT_INTERVAL ||
 		lastSentState.size === 0;
-	ticksSinceFullSnapshot = isFull ? 0 : ticksSinceFullSnapshot + 1;
+
+	if (isFull) {
+		ticksSinceFullSnapshot = 0;
+		seqNumber = 0;
+	} else {
+		ticksSinceFullSnapshot++;
+		seqNumber = (seqNumber + 1) & 0xff;
+	}
 
 	let toSend;
 	if (isFull) {
@@ -123,11 +147,16 @@ setInterval(() => {
 	const totalEntries = toSend.length + removed.length;
 	if (totalEntries === 0 && !isFull) return;
 
-	const buf = Buffer.alloc(3 + totalEntries * PLAYER_SIZE);
-	buf.writeUInt8(isFull ? 0 : 1, 0);
-	buf.writeUInt16LE(totalEntries, 1);
+	const payloadSize = HEADER_SIZE + totalEntries * PLAYER_SIZE;
+	const buf = Buffer.alloc(payloadSize + SIG_SIZE);
 
-	let offset = 3;
+	// Header
+	buf.writeUInt8(isFull ? 0 : 1, 0);
+	buf.writeUInt8(seqNumber, 1);
+	buf.writeUInt16LE(totalEntries, 2);
+
+	// Player entries
+	let offset = HEADER_SIZE;
 	for (const p of toSend) {
 		const flags = p.grounded ? 1 : 0;
 		buf.writeUInt16LE(p.id, offset);
@@ -145,11 +174,16 @@ setInterval(() => {
 		offset += PLAYER_SIZE;
 	}
 
-	const sent = bridge.broadcastState(buf.subarray(0, offset));
+	// Sign the payload (everything before signature)
+	const payload = buf.subarray(0, payloadSize);
+	const sig = crypto.sign(null, payload, SIGN_PRIVATE);
+	sig.copy(buf, payloadSize);
+
+	const sent = bridge.broadcastState(buf.subarray(0, payloadSize + SIG_SIZE));
 	if (playerList.length > 0 && debugCounter++ % NET_RATE === 0) {
 		const stats = relayTree.getStats();
 		console.log(
-			`Net: ${playerList.length} players, ${offset}B ${isFull ? "FULL" : "delta(" + toSend.length + ")"}, relays: ${stats.relays}, leaves: ${stats.leaves}`
+			`Net: ${playerList.length} players, ${payloadSize + SIG_SIZE}B seq=${seqNumber} ${isFull ? "FULL" : "delta(" + toSend.length + ")"}, relays: ${stats.relays}, leaves: ${stats.leaves}`
 		);
 	}
 }, 1000 / NET_RATE);
@@ -231,7 +265,8 @@ async function handleConfig(req, res) {
 		playerId,
 		inputChannelName,
 		bridgeSessionId: bridge.sessionId,
-		relay: assignment, // { role: 'relay'|'leaf', relayParentId }
+		signPublicKey: SIGN_PUBLIC_RAW.toString("base64"),
+		relay: assignment,
 		map: MAP,
 	}));
 }
@@ -257,10 +292,15 @@ async function handleCallsProxy(req, res) {
 // --- Register: player connected, set up input channel + P2P signaling ---
 async function handleRegister(req, res) {
 	const body = await readBody(req);
-	const { playerId, sessionId, inputChannelName, p2pOffer } = JSON.parse(body);
+	const { playerId, sessionId, inputChannelName, p2pOffer, capabilities } = JSON.parse(body);
 
 	world.addPlayer(playerId);
 	players.set(playerId, { sessionId, inputChannelName });
+
+	// Update relay tree with client capabilities for better relay selection
+	if (capabilities) {
+		relayTree.updateCapabilities(playerId, capabilities);
+	}
 
 	// Subscribe bridge to player's input channel
 	if (bridge) {

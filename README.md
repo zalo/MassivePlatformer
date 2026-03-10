@@ -103,13 +103,14 @@ Bit 2: jump
 ```
 Only sent when input state changes. 1 byte per input event.
 
-### State (server → all players): delta-compressed
+### State (server → all players): signed, sequenced, delta-compressed
 
 ```
-[type:u8] [count:u16] [..players]
+[type:u8] [seq:u8] [count:u16] [..players] [signature:64B]
 
-type 0 = full snapshot (all players, sent every 3 seconds)
+type 0 = full snapshot (resets seq to 0)
 type 1 = delta (only changed players since last broadcast)
+seq  = 0-255, increments each delta, resets to 0 on full snapshot
 
 Per player entry (11 bytes):
   [id:u16] [x:f32] [y:f32] [flags:u8]
@@ -117,9 +118,17 @@ Per player entry (11 bytes):
 flags:
   bit 0 = grounded
   bit 1 = removed (player disconnected)
+
+signature: Ed25519 over the payload (everything before the 64-byte signature)
 ```
 
-Physics runs at 45hz server-side (3x the network rate). Network broadcasts are decoupled at 15hz — exactly one broadcast every 3 physics ticks. Full snapshots every 3 seconds ensure clients recover from packet loss. Delta ticks only include players whose position changed by more than 0.3px since last broadcast. Stationary players cost zero bandwidth between snapshots.
+**Sequencing**: Deltas are numbered relative to the last full snapshot. Clients discard deltas with stale sequence numbers (out-of-order arrivals on unreliable channels). Full snapshots reset the counter, ensuring recovery.
+
+**Signing**: Every packet is Ed25519-signed by the server. Relay nodes forward packets verbatim — they cannot forge or modify state without invalidating the signature. Clients receiving data via P2P verify the signature before applying. The signing public key is distributed via `/api/config`.
+
+**Relay selection**: The server scores each player's suitability as a relay based on session age (stability), RTT to SFU (latency), upload bandwidth, connection type (ethernet > wifi > cellular), and mobile vs desktop. The tree rebalances every 10 seconds, swapping low-scoring relays for high-scoring leaves.
+
+Physics runs at 45hz server-side (3x the network rate). Network broadcasts at 15hz — exactly one broadcast every 3 physics ticks. Full snapshots every 3 seconds. Delta ticks only include players whose position changed by >0.3px. Stationary players cost zero bandwidth between snapshots.
 
 ## Setup
 

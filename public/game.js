@@ -10,19 +10,27 @@ const RELAY_POLL_MS = 500; // How often relays poll for new children
 
 // --- State ---
 let myPlayerId = null;
-let myRole = null; // 'relay' or 'leaf'
+let myRole = null;
 let map = null;
 let inputChannel = null;
-let stateChannel = null; // SFU channel (relay always has this; leaf uses as fallback)
+let stateChannel = null;
 let lastSentInput = -1;
 let lastSendTime = 0;
 
 // P2P relay state
-let relayParentPC = null; // Leaf's P2P connection to relay parent
-let relayParentDC = null; // Leaf's data channel from relay parent
-let relayChildPCs = new Map(); // Relay's P2P connections to children: childId -> { pc, dc }
+let relayParentPC = null;
+let relayParentDC = null;
+let relayChildPCs = new Map();
 let relayPollTimer = null;
-let sfuFallback = false; // Leaf: true if using SFU directly (relay disconnected)
+let sfuFallback = false;
+
+// Signature verification
+let signPublicKey = null; // CryptoKey for Ed25519 verify
+const SIG_SIZE = 64;
+
+// Sequence tracking: discard stale deltas
+let lastSeq = -1; // -1 = no packets received yet
+let lastFullSeq = -1; // seq of the most recent full snapshot
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
@@ -69,6 +77,40 @@ function readInput() {
 	return s;
 }
 
+// --- Signature verification ---
+async function importSigningKey(base64Der) {
+	const der = Uint8Array.from(atob(base64Der), (c) => c.charCodeAt(0));
+	return crypto.subtle.importKey("spki", der, { name: "Ed25519" }, false, ["verify"]);
+}
+
+async function verifyPacket(data) {
+	if (!signPublicKey) return true; // No key = skip verification (shouldn't happen)
+	if (data.byteLength <= SIG_SIZE) return false;
+	const payload = data.slice(0, data.byteLength - SIG_SIZE);
+	const sig = data.slice(data.byteLength - SIG_SIZE);
+	return crypto.subtle.verify("Ed25519", signPublicKey, sig, payload);
+}
+
+// --- Client capability detection ---
+function detectCapabilities() {
+	const caps = {
+		isMobile: /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent),
+		rttMs: 999,
+		uplinkMbps: 0,
+		connectionType: "unknown",
+	};
+
+	// Network Information API (Chrome/Android)
+	const conn = navigator.connection || navigator.mozConnection;
+	if (conn) {
+		caps.connectionType = conn.type || conn.effectiveType || "unknown";
+		if (conn.downlink) caps.uplinkMbps = conn.downlink; // Rough estimate
+		if (conn.rtt) caps.rttMs = conn.rtt;
+	}
+
+	return caps;
+}
+
 // --- Calls API proxy ---
 async function callsAPI(path, body) {
 	const opts = { method: "POST", headers: { "Content-Type": "application/json" } };
@@ -88,6 +130,16 @@ async function join() {
 	map = config.map;
 	myRole = config.relay.role;
 	const { bridgeSessionId, inputChannelName } = config;
+
+	// Import signing public key for packet verification
+	if (config.signPublicKey) {
+		try {
+			signPublicKey = await importSigningKey(config.signPublicKey);
+			console.log("Signing key imported for packet verification");
+		} catch (e) {
+			console.warn("Failed to import signing key:", e);
+		}
+	}
 
 	statusEl.textContent = `Connecting (${myRole})...`;
 
@@ -179,7 +231,7 @@ async function join() {
 			console.log("P2P relay channel open — switching off SFU fallback");
 			sfuFallback = false;
 		};
-		relayParentDC.onmessage = (evt) => handleStateUpdate(evt.data);
+		relayParentDC.onmessage = (evt) => processStatePacket(evt.data, true);
 
 		// Also listen for incoming data channels (relay creates the channel)
 		relayParentPC.ondatachannel = (evt) => {
@@ -191,7 +243,7 @@ async function join() {
 				sfuFallback = false;
 				relayParentDC = dc;
 			};
-			dc.onmessage = (evt) => handleStateUpdate(evt.data);
+			dc.onmessage = (evt) => processStatePacket(evt.data, true);
 		};
 
 		const p2pOfferDesc = await relayParentPC.createOffer();
@@ -208,7 +260,7 @@ async function join() {
 		p2pOffer = relayParentPC.localDescription.sdp;
 	}
 
-	// --- Register with game server ---
+	// --- Register with game server (include capabilities for relay scoring) ---
 	await fetch("/api/register", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -217,6 +269,7 @@ async function join() {
 			sessionId: sess.sessionId,
 			inputChannelName,
 			p2pOffer,
+			capabilities: detectCapabilities(),
 		}),
 	});
 
@@ -242,19 +295,17 @@ async function join() {
 // --- SFU state handler: relay forwards, leaf uses as fallback ---
 function handleSFUState(data) {
 	if (myRole === "relay") {
-		// Forward to all P2P children
+		// Forward raw bytes to all P2P children (including signature)
 		for (const [childId, { dc }] of relayChildPCs) {
 			if (dc && dc.readyState === "open") {
 				try { dc.send(data); } catch (e) {}
 			}
 		}
-		// Also apply locally
-		handleStateUpdate(data);
+		// Apply locally (relay trusts SFU data, skip verification for self)
+		processStatePacket(data, false);
 	} else if (sfuFallback) {
-		// Leaf using SFU as fallback
-		handleStateUpdate(data);
+		processStatePacket(data, false); // Direct from SFU = trusted
 	}
-	// If leaf with active P2P, ignore SFU data (P2P is the source)
 }
 
 // --- Relay: poll for pending child offers ---
@@ -344,19 +395,62 @@ function sendInput() {
 	}
 }
 
+// --- Packet processing: verify signature, check sequence, parse state ---
+async function processStatePacket(data, needsVerification) {
+	const buf = data instanceof ArrayBuffer ? data : data.buffer || data;
+	if (buf.byteLength <= SIG_SIZE + 4) return; // Too small
+
+	// Verify signature if data came via P2P relay (untrusted)
+	if (needsVerification && signPublicKey) {
+		const valid = await verifyPacket(buf);
+		if (!valid) {
+			console.warn("Dropped packet: invalid signature");
+			return;
+		}
+	}
+
+	// Parse header: [type:u8, seq:u8, count:u16]
+	const view = new DataView(buf);
+	const type = view.getUint8(0);
+	const seq = view.getUint8(1);
+
+	if (type === 0) {
+		// Full snapshot: reset sequence tracking
+		lastFullSeq = seq;
+		lastSeq = seq;
+	} else {
+		// Delta: discard if stale (seq <= lastSeq, accounting for wrap)
+		// Sequence is 0-255, reset on each full snapshot.
+		// A delta is stale if its seq is <= lastSeq (within half the range).
+		const diff = (seq - lastSeq + 256) % 256;
+		if (diff === 0 || diff > 128) {
+			// seq is same or older than lastSeq — drop
+			return;
+		}
+		lastSeq = seq;
+	}
+
+	// Strip signature for parsing (payload is everything before sig)
+	const payloadLen = buf.byteLength - SIG_SIZE;
+	handleStateUpdate(buf.slice(0, payloadLen));
+}
+
 // --- Player state ---
 const playerMap = new Map();
 
 function handleStateUpdate(data) {
 	const buf = new DataView(data instanceof ArrayBuffer ? data : data.buffer || data);
+	// Header: [type:u8, seq:u8, count:u16] = 4 bytes
 	const type = buf.getUint8(0);
-	const count = buf.getUint16(1, true);
+	// seq already handled by processStatePacket
+	const count = buf.getUint16(2, true);
 	const PS = 11;
+	const HEADER = 4;
 
 	if (type === 0) {
 		const seen = new Set();
 		for (let i = 0; i < count; i++) {
-			const o = 3 + i * PS;
+			const o = HEADER + i * PS;
 			const id = buf.getUint16(o, true);
 			const flags = buf.getUint8(o + 10);
 			if (flags & 2) { playerMap.delete(id); continue; }
@@ -373,7 +467,7 @@ function handleStateUpdate(data) {
 		}
 	} else {
 		for (let i = 0; i < count; i++) {
-			const o = 3 + i * PS;
+			const o = HEADER + i * PS;
 			const id = buf.getUint16(o, true);
 			const flags = buf.getUint8(o + 10);
 			if (flags & 2) { playerMap.delete(id); continue; }
