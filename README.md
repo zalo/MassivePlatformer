@@ -40,9 +40,9 @@ A massively multiplayer 2D side-scrolling platformer where hundreds of players a
 
 2. **Physics runs centrally**: The game server runs server-authoritative physics at 45hz — gravity, movement, platform collision for every player.
 
-3. **State fans out via P2P relay tree**: The bridge publishes delta-compressed state at 15hz to a single SFU data channel. A small number of **relay nodes** (≈√N players) subscribe to this channel via the SFU. Each relay then forwards state to its assigned **leaf nodes** over direct P2P WebRTC data channels — bypassing the SFU entirely.
+3. **State fans out via 3-channel P2P relay tree**: The bridge publishes delta-compressed state at 15hz, split across 3 SFU data channels (A/B/C, 5hz each, staggered). Each leaf node connects to **3 different relay nodes** (one per channel) via direct P2P WebRTC. If any single relay dies, the leaf still receives 10hz from the other two — no gap, no SFU fallback needed.
 
-4. **Automatic fallback**: Leaf nodes that lose their P2P relay connection fall back to receiving state directly from the SFU until reassigned. Full snapshots every 3 seconds ensure recovery from any lost data.
+4. **Automatic fallback and self-healing**: Leaf nodes with missing P2P channels fall back to the SFU for those channels. The relay tree rebalances every 10 seconds, replacing lost relays and reassigning orphaned leaves. Full snapshots go to all 3 channels simultaneously for loss recovery.
 
 ### Why this architecture
 

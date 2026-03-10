@@ -8,7 +8,9 @@ class Bridge {
 		this.appToken = appToken;
 		this.sessionId = null;
 		this.pc = null;
-		this.stateChannel = null;
+		// 3 state channels: A, B, C (5hz each, staggered = 15hz total)
+		this.stateChannels = [null, null, null];
+		this.stateChannelNames = ["game-state-a", "game-state-b", "game-state-c"];
 		// playerId -> { channelId, dataChannel }
 		this.playerInputChannels = new Map();
 		// playerId -> input state
@@ -83,34 +85,23 @@ class Bridge {
 			bootstrapDC.close();
 		});
 
-		// Create the game-state channel (bridge publishes, players subscribe)
-		const stateResp = await this._callsAPI(
-			`/sessions/${this.sessionId}/datachannels/new`,
-			{
-				dataChannels: [
-					{
-						location: "local",
-						dataChannelName: "game-state",
-					},
-				],
-			}
-		);
+		// Create 3 state channels (A, B, C) for redundant relay paths
+		for (let i = 0; i < 3; i++) {
+			const name = this.stateChannelNames[i];
+			const resp = await this._callsAPI(
+				`/sessions/${this.sessionId}/datachannels/new`,
+				{ dataChannels: [{ location: "local", dataChannelName: name }] }
+			);
+			const channelId = resp.dataChannels[0].id;
+			console.log(`${name} channel ID: ${channelId}`);
 
-		const stateChannelId = stateResp.dataChannels[0].id;
-		console.log(`Game-state channel ID: ${stateChannelId}`);
-
-		this.stateChannel = this.pc.createDataChannel("game-state", {
-			negotiated: true,
-			id: stateChannelId,
-		});
-
-		this.stateChannel.onOpen(() => {
-			console.log("Game state channel open");
-		});
-
-		this.stateChannel.onError((err) => {
-			console.error("State channel error:", err);
-		});
+			this.stateChannels[i] = this.pc.createDataChannel(name, {
+				negotiated: true,
+				id: channelId,
+			});
+			this.stateChannels[i].onOpen(() => console.log(`${name} open`));
+			this.stateChannels[i].onError((err) => console.error(`${name} error:`, err));
+		}
 
 		// Handle unexpected incoming data channels
 		this.pc.onDataChannel((dc) => {
@@ -174,10 +165,12 @@ class Bridge {
 		this.playerLastInput.delete(playerId);
 	}
 
-	broadcastState(buffer) {
-		if (this.stateChannel) {
+	// Send state on a specific channel (0, 1, or 2)
+	broadcastState(buffer, channelIndex) {
+		const ch = this.stateChannels[channelIndex];
+		if (ch) {
 			try {
-				this.stateChannel.sendMessageBinary(buffer);
+				ch.sendMessageBinary(buffer);
 				return true;
 			} catch (e) {
 				return false;

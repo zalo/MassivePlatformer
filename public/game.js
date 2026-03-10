@@ -17,10 +17,14 @@ let stateChannel = null;
 let lastSentInput = -1;
 let lastSendTime = 0;
 
-// P2P relay state
-let relayParentPC = null;
-let relayParentDC = null;
-let relayChildPCs = new Map();
+// P2P relay state — 3 channels
+const NUM_CHANNELS = 3;
+// Leaf: one P2P connection per channel to (up to 3 different) relays
+let relayParentPCs = [null, null, null];  // PeerConnections
+let relayParentDCs = [null, null, null];  // DataChannels
+let relayParentActive = [false, false, false]; // Is this channel receiving via P2P?
+// Relay: children per channel
+let relayChildPCs = [new Map(), new Map(), new Map()]; // channel -> Map(childId -> {pc, dc})
 let relayPollTimer = null;
 let sfuFallback = false;
 
@@ -186,78 +190,90 @@ async function join() {
 	inputChannel.binaryType = "arraybuffer";
 	inputChannel.onopen = () => console.log("Input channel open");
 
-	// Game state channel via SFU
-	// Relay: always subscribes (source of truth, forwards to children)
-	// Leaf: subscribes as fallback (used until P2P relay connects)
-	if (myRole === "relay" || myRole === "leaf") {
+	// Subscribe to SFU state channels
+	// Relay: subscribes to all 3 channels (source of truth, forwards to children)
+	// Leaf: subscribes to all 3 as fallback (used until P2P relays connect)
+	const channelNames = ["game-state-a", "game-state-b", "game-state-c"];
+	const sfuStateChannels = [];
+	for (let ch = 0; ch < NUM_CHANNELS; ch++) {
 		const stateResp = await callsAPI(
 			`/sessions/${sess.sessionId}/datachannels/new`,
-			{ dataChannels: [{ location: "remote", sessionId: bridgeSessionId, dataChannelName: "game-state" }] }
+			{ dataChannels: [{ location: "remote", sessionId: bridgeSessionId, dataChannelName: channelNames[ch] }] }
 		);
-		stateChannel = pc.createDataChannel("game-state-sub", {
+		const dc = pc.createDataChannel(`${channelNames[ch]}-sub`, {
 			negotiated: true, id: stateResp.dataChannels[0].id,
 			ordered: false, maxRetransmits: 0,
 		});
-		stateChannel.binaryType = "arraybuffer";
-		stateChannel.onopen = () => console.log("SFU state channel open");
-		stateChannel.onmessage = (evt) => handleSFUState(evt.data);
-
-		if (myRole === "leaf") {
-			sfuFallback = true; // Use SFU until P2P relay connects
-		}
+		dc.binaryType = "arraybuffer";
+		dc.onopen = () => console.log(`SFU ${channelNames[ch]} open`);
+		const chIdx = ch;
+		dc.onmessage = (evt) => handleSFUState(evt.data, chIdx);
+		sfuStateChannels.push(dc);
 	}
+	if (myRole === "leaf") sfuFallback = true;
 
-	// --- P2P offer for leaf nodes ---
-	let p2pOffer = null;
-	if (myRole === "leaf" && config.relay.relayParentId) {
-		// Create P2P PeerConnection to relay parent
-		relayParentPC = new RTCPeerConnection({
-			iceServers: [{ urls: STUN_SERVER }],
-		});
-		relayParentPC.onconnectionstatechange = () => {
-			console.log("Relay P2P:", relayParentPC.connectionState);
-			if (relayParentPC.connectionState === "failed" || relayParentPC.connectionState === "disconnected") {
-				console.log("Relay P2P lost, falling back to SFU");
-				sfuFallback = true;
-			}
-		};
+	// --- P2P offers for leaf nodes (one per channel, to different relays) ---
+	let p2pOffers = null;
+	if (myRole === "leaf" && config.relay.relayParentIds) {
+		p2pOffers = [];
+		for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+			const relayId = config.relay.relayParentIds[ch];
+			if (!relayId) continue;
 
-		// Create the data channel that relay will send state on
-		relayParentDC = relayParentPC.createDataChannel("relay-state", {
-			ordered: false, maxRetransmits: 0,
-		});
-		relayParentDC.binaryType = "arraybuffer";
-		relayParentDC.onopen = () => {
-			console.log("P2P relay channel open — switching off SFU fallback");
-			sfuFallback = false;
-		};
-		relayParentDC.onmessage = (evt) => processStatePacket(evt.data, true);
+			const chPC = new RTCPeerConnection({ iceServers: [{ urls: STUN_SERVER }] });
+			const chIdx = ch;
 
-		// Also listen for incoming data channels (relay creates the channel)
-		relayParentPC.ondatachannel = (evt) => {
-			console.log("P2P incoming channel:", evt.channel.label);
-			const dc = evt.channel;
-			dc.binaryType = "arraybuffer";
-			dc.onopen = () => {
-				console.log("P2P relay channel open (incoming) — switching off SFU fallback");
-				sfuFallback = false;
-				relayParentDC = dc;
+			chPC.onconnectionstatechange = () => {
+				console.log(`P2P ch${chIdx}:`, chPC.connectionState);
+				if (chPC.connectionState === "failed" || chPC.connectionState === "disconnected") {
+					relayParentActive[chIdx] = false;
+				}
 			};
-			dc.onmessage = (evt) => processStatePacket(evt.data, true);
-		};
 
-		const p2pOfferDesc = await relayParentPC.createOffer();
-		await relayParentPC.setLocalDescription(p2pOfferDesc);
-
-		// Wait for ICE gathering
-		await new Promise((resolve) => {
-			if (relayParentPC.iceGatheringState === "complete") return resolve();
-			relayParentPC.onicegatheringstatechange = () => {
-				if (relayParentPC.iceGatheringState === "complete") resolve();
+			// Create data channel for receiving state from relay
+			const chDC = chPC.createDataChannel(`relay-state-${ch}`, {
+				ordered: false, maxRetransmits: 0,
+			});
+			chDC.binaryType = "arraybuffer";
+			chDC.onopen = () => {
+				console.log(`P2P ch${chIdx} open`);
+				relayParentActive[chIdx] = true;
+				// Check if all channels are active → disable SFU fallback
+				if (relayParentActive.every(Boolean)) sfuFallback = false;
 			};
-		});
+			chDC.onmessage = (evt) => processStatePacket(evt.data, true);
 
-		p2pOffer = relayParentPC.localDescription.sdp;
+			// Also handle relay-initiated channels
+			chPC.ondatachannel = (evt) => {
+				const dc = evt.channel;
+				dc.binaryType = "arraybuffer";
+				dc.onopen = () => {
+					console.log(`P2P ch${chIdx} open (incoming)`);
+					relayParentActive[chIdx] = true;
+					relayParentDCs[chIdx] = dc;
+					if (relayParentActive.every(Boolean)) sfuFallback = false;
+				};
+				dc.onmessage = (evt) => processStatePacket(evt.data, true);
+			};
+
+			const offerDesc = await chPC.createOffer();
+			await chPC.setLocalDescription(offerDesc);
+
+			await new Promise((resolve) => {
+				if (chPC.iceGatheringState === "complete") return resolve();
+				chPC.onicegatheringstatechange = () => {
+					if (chPC.iceGatheringState === "complete") resolve();
+				};
+			});
+
+			relayParentPCs[ch] = chPC;
+			relayParentDCs[ch] = chDC;
+			p2pOffers.push({
+				channel: ch,
+				relayId,
+				sdp: chPC.localDescription.sdp,
+			});
+		}
 	}
 
 	// --- Register with game server (include capabilities for relay scoring) ---
@@ -268,14 +284,14 @@ async function join() {
 			playerId: myPlayerId,
 			sessionId: sess.sessionId,
 			inputChannelName,
-			p2pOffer,
+			p2pOffer: p2pOffers,
 			capabilities: detectCapabilities(),
 		}),
 	});
 
-	// --- Leaf: poll for P2P answer from relay ---
-	if (myRole === "leaf" && p2pOffer) {
-		pollForRelayAnswer();
+	// --- Leaf: poll for P2P answers from relays ---
+	if (myRole === "leaf" && p2pOffers && p2pOffers.length > 0) {
+		pollForRelayAnswers();
 	}
 
 	// --- Relay: poll for new children ---
@@ -292,61 +308,60 @@ async function join() {
 	});
 }
 
-// --- SFU state handler: relay forwards, leaf uses as fallback ---
-function handleSFUState(data) {
+// --- SFU state handler: relay forwards to channel-specific children, leaf uses as fallback ---
+function handleSFUState(data, channelIdx) {
 	if (myRole === "relay") {
-		// Forward raw bytes to all P2P children (including signature)
-		for (const [childId, { dc }] of relayChildPCs) {
+		// Forward to P2P children subscribed to THIS channel
+		const children = relayChildPCs[channelIdx];
+		for (const [childId, { dc }] of children) {
 			if (dc && dc.readyState === "open") {
 				try { dc.send(data); } catch (e) {}
 			}
 		}
-		// Apply locally (relay trusts SFU data, skip verification for self)
+		// Apply locally (trusted)
 		processStatePacket(data, false);
-	} else if (sfuFallback) {
-		processStatePacket(data, false); // Direct from SFU = trusted
+	} else if (sfuFallback || !relayParentActive[channelIdx]) {
+		// Leaf: use SFU for this channel if P2P relay isn't active
+		processStatePacket(data, false);
 	}
+	// If leaf has active P2P for this channel, ignore SFU data
 }
 
 // --- Relay: poll for pending child offers ---
 async function pollForChildren() {
 	try {
 		const resp = await (await fetch(`/api/relay-pending?relayId=${myPlayerId}`)).json();
-		for (const { childId, sdp } of resp.offers) {
-			console.log(`Relay: new child ${childId}, creating P2P answer`);
-			await acceptChild(childId, sdp);
+		for (const { childId, channel, sdp } of resp.offers) {
+			console.log(`Relay: new child ${childId} on ch${channel}`);
+			await acceptChild(childId, channel, sdp);
 		}
 	} catch (e) {
 		console.error("Relay poll error:", e);
 	}
 }
 
-// --- Relay: accept a child's P2P offer ---
-async function acceptChild(childId, offerSdp) {
-	const childPC = new RTCPeerConnection({
-		iceServers: [{ urls: STUN_SERVER }],
-	});
+// --- Relay: accept a child's P2P offer for a specific channel ---
+async function acceptChild(childId, channel, offerSdp) {
+	const childPC = new RTCPeerConnection({ iceServers: [{ urls: STUN_SERVER }] });
 
 	childPC.onconnectionstatechange = () => {
-		console.log(`Relay->Child ${childId} PC:`, childPC.connectionState);
+		console.log(`Relay->child ${childId} ch${channel}:`, childPC.connectionState);
 		if (childPC.connectionState === "failed" || childPC.connectionState === "disconnected") {
-			relayChildPCs.delete(childId);
+			relayChildPCs[channel].delete(childId);
 			childPC.close();
 		}
 	};
 
-	// Create data channel for sending state to child
-	const dc = childPC.createDataChannel("relay-state", {
+	const dc = childPC.createDataChannel(`relay-state-${channel}`, {
 		ordered: false, maxRetransmits: 0,
 	});
 	dc.binaryType = "arraybuffer";
-	dc.onopen = () => console.log(`Relay: P2P channel to child ${childId} open`);
+	dc.onopen = () => console.log(`Relay: ch${channel}->child ${childId} open`);
 
 	await childPC.setRemoteDescription({ type: "offer", sdp: offerSdp });
 	const answer = await childPC.createAnswer();
 	await childPC.setLocalDescription(answer);
 
-	// Wait for ICE gathering
 	await new Promise((resolve) => {
 		if (childPC.iceGatheringState === "complete") return resolve();
 		childPC.onicegatheringstatechange = () => {
@@ -354,33 +369,34 @@ async function acceptChild(childId, offerSdp) {
 		};
 	});
 
-	// Send answer to server
 	await fetch("/api/relay-answer", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			childId,
-			answer: childPC.localDescription.sdp,
-		}),
+		body: JSON.stringify({ childId, channel, answer: childPC.localDescription.sdp }),
 	});
 
-	relayChildPCs.set(childId, { pc: childPC, dc });
+	relayChildPCs[channel].set(childId, { pc: childPC, dc });
 }
 
-// --- Leaf: poll for P2P answer from relay ---
-async function pollForRelayAnswer() {
-	for (let i = 0; i < 20; i++) { // Try for 10 seconds
+// --- Leaf: poll for P2P answers from relays (multiple channels) ---
+async function pollForRelayAnswers() {
+	const pending = new Set([0, 1, 2].filter((ch) => relayParentPCs[ch] !== null));
+	for (let i = 0; i < 20 && pending.size > 0; i++) {
 		try {
 			const resp = await (await fetch(`/api/relay-answer/${myPlayerId}`)).json();
-			if (resp.answer) {
-				console.log("Got P2P answer from relay");
-				await relayParentPC.setRemoteDescription({ type: "answer", sdp: resp.answer });
-				return;
+			for (const { channel, sdp } of resp.answers || []) {
+				if (relayParentPCs[channel]) {
+					console.log(`Got P2P answer for ch${channel}`);
+					await relayParentPCs[channel].setRemoteDescription({ type: "answer", sdp });
+					pending.delete(channel);
+				}
 			}
 		} catch (e) {}
-		await new Promise((r) => setTimeout(r, RELAY_POLL_MS));
+		if (pending.size > 0) await new Promise((r) => setTimeout(r, RELAY_POLL_MS));
 	}
-	console.log("No P2P answer received — staying on SFU fallback");
+	if (pending.size > 0) {
+		console.log(`${pending.size} P2P channels didn't connect — using SFU for those`);
+	}
 }
 
 // --- Input send ---
@@ -522,9 +538,14 @@ function render() {
 	// HUD
 	ctx.fillStyle = "#888"; ctx.font = "12px monospace"; ctx.textAlign = "right";
 	ctx.fillText(`Players: ${playerMap.size}`, canvas.width - 10, 20);
-	const roleLabel = myRole === "relay"
-		? `RELAY (${relayChildPCs.size} children)`
-		: sfuFallback ? "LEAF (SFU fallback)" : "LEAF (P2P)";
+	let roleLabel;
+	if (myRole === "relay") {
+		const totalChildren = relayChildPCs.reduce((s, m) => s + m.size, 0);
+		roleLabel = `RELAY (${totalChildren} children)`;
+	} else {
+		const activeCount = relayParentActive.filter(Boolean).length;
+		roleLabel = `LEAF (${activeCount}/${NUM_CHANNELS} P2P${sfuFallback ? " +SFU" : ""})`;
+	}
 	ctx.fillText(roleLabel, canvas.width - 10, 36);
 
 	requestAnimationFrame(render);

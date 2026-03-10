@@ -2,7 +2,8 @@
 // Assigns players as relay nodes or leaf nodes based on capability scoring.
 // Relays subscribe to the SFU game-state channel and forward to children via P2P.
 
-const RELAY_CAPACITY = 20;
+const NUM_CHANNELS = 3; // A, B, C
+const RELAY_CAPACITY = 20; // Max children per relay per channel
 const MIN_AGE_FOR_RELAY_MS = 5000;
 const REBALANCE_INTERVAL_MS = 10000;
 
@@ -17,17 +18,18 @@ class RelayTree {
 	assignRole(playerId) {
 		this.nodes.set(playerId, {
 			role: "pending",
-			relayParentId: null,
-			childIds: new Set(),
+			// For leaves: 3 relay parents (one per channel). null = unassigned.
+			relayParentIds: [null, null, null],
+			// For relays: children per channel
+			childIds: [new Set(), new Set(), new Set()],
 			joinTime: Date.now(),
-			pendingOffers: new Map(),
+			pendingOffers: new Map(), // childId -> offer SDP
 			pendingAnswer: null,
-			// Capability scoring (updated by client on register)
 			capabilities: {
 				isMobile: false,
-				rttMs: 999,        // RTT to SFU (lower = better relay)
-				uplinkMbps: 0,     // Estimated upload bandwidth
-				connectionType: "", // wifi, cellular, ethernet, unknown
+				rttMs: 999,
+				uplinkMbps: 0,
+				connectionType: "",
 			},
 			relayScore: 0,
 		});
@@ -37,17 +39,32 @@ class RelayTree {
 
 		if (this.relayIds.size < idealRelayCount) {
 			this._promoteToRelay(playerId);
-			return { role: "relay", relayParentId: null };
+			return { role: "relay", relayParentIds: [null, null, null] };
 		}
 
-		const relayId = this._findBestRelay();
-		if (relayId !== null) {
-			this._assignToRelay(playerId, relayId);
-			return { role: "leaf", relayParentId: relayId };
+		// Assign to 3 different relays (one per channel), preferring diversity
+		const relayParentIds = [null, null, null];
+		const usedRelays = new Set();
+		for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+			const relayId = this._findBestRelayForChannel(ch, usedRelays);
+			if (relayId !== null) {
+				relayParentIds[ch] = relayId;
+				usedRelays.add(relayId);
+				this._assignToRelayChannel(playerId, relayId, ch);
+			}
 		}
 
-		this._promoteToRelay(playerId);
-		return { role: "relay", relayParentId: null };
+		const node = this.nodes.get(playerId);
+		node.role = "leaf";
+		node.relayParentIds = relayParentIds;
+
+		// If no relays available at all, become a relay
+		if (relayParentIds.every((id) => id === null)) {
+			this._promoteToRelay(playerId);
+			return { role: "relay", relayParentIds: [null, null, null] };
+		}
+
+		return { role: "leaf", relayParentIds };
 	}
 
 	// Update a node's capabilities (called when client registers with metrics)
@@ -92,17 +109,29 @@ class RelayTree {
 		if (!node) return;
 
 		if (node.role === "relay") {
-			for (const childId of node.childIds) {
-				const child = this.nodes.get(childId);
-				if (child) {
-					child.relayParentId = null;
-					child.role = "orphan";
+			// Orphan children on all channels this relay served
+			for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+				for (const childId of node.childIds[ch]) {
+					const child = this.nodes.get(childId);
+					if (child) {
+						child.relayParentIds[ch] = null;
+						// Mark as orphan only if ALL channels lost
+						if (child.relayParentIds.every((id) => id === null)) {
+							child.role = "orphan";
+						}
+					}
 				}
 			}
 			this.relayIds.delete(playerId);
-		} else if (node.relayParentId) {
-			const parent = this.nodes.get(node.relayParentId);
-			if (parent) parent.childIds.delete(playerId);
+		} else {
+			// Remove leaf from its relay parents
+			for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+				const parentId = node.relayParentIds[ch];
+				if (parentId) {
+					const parent = this.nodes.get(parentId);
+					if (parent) parent.childIds[ch].delete(playerId);
+				}
+			}
 		}
 
 		this.nodes.delete(playerId);
@@ -112,61 +141,73 @@ class RelayTree {
 		return this.nodes.get(playerId);
 	}
 
-	storeOffer(childId, relayId, offerSdp) {
+	// Store a P2P offer from a leaf, keyed by relay+channel
+	storeOffer(childId, relayId, channel, offerSdp) {
 		const relay = this.nodes.get(relayId);
-		if (relay) relay.pendingOffers.set(childId, offerSdp);
+		if (relay) relay.pendingOffers.set(`${childId}:${channel}`, { childId, channel, sdp: offerSdp });
 	}
 
 	getPendingOffers(relayId) {
 		const relay = this.nodes.get(relayId);
 		if (!relay) return [];
-		const offers = [];
-		for (const [childId, sdp] of relay.pendingOffers) {
-			offers.push({ childId, sdp });
-		}
+		const offers = Array.from(relay.pendingOffers.values());
 		relay.pendingOffers.clear();
 		return offers;
 	}
 
-	storeAnswer(childId, answerSdp) {
+	// Answers keyed by childId:channel
+	storeAnswer(childId, channel, answerSdp) {
 		const child = this.nodes.get(childId);
-		if (child) child.pendingAnswer = answerSdp;
+		if (child) {
+			if (!child.pendingAnswers) child.pendingAnswers = new Map();
+			child.pendingAnswers.set(channel, answerSdp);
+		}
 	}
 
-	getAnswer(childId) {
+	getAnswers(childId) {
 		const child = this.nodes.get(childId);
-		if (!child || !child.pendingAnswer) return null;
-		const answer = child.pendingAnswer;
-		child.pendingAnswer = null;
-		return answer;
+		if (!child || !child.pendingAnswers || child.pendingAnswers.size === 0) return [];
+		const answers = [];
+		for (const [channel, sdp] of child.pendingAnswers) {
+			answers.push({ channel, sdp });
+		}
+		child.pendingAnswers.clear();
+		return answers;
 	}
 
 	_promoteToRelay(playerId) {
 		const node = this.nodes.get(playerId);
 		if (!node) return;
 		node.role = "relay";
-		node.relayParentId = null;
+		node.relayParentIds = [null, null, null];
+		// Remove from any relay parents
+		for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+			const parentId = node.relayParentIds[ch];
+			if (parentId) {
+				const parent = this.nodes.get(parentId);
+				if (parent) parent.childIds[ch].delete(playerId);
+			}
+		}
 		this.relayIds.add(playerId);
 	}
 
-	_assignToRelay(playerId, relayId) {
-		const node = this.nodes.get(playerId);
+	_assignToRelayChannel(playerId, relayId, channel) {
 		const relay = this.nodes.get(relayId);
-		if (!node || !relay) return;
-		node.role = "leaf";
-		node.relayParentId = relayId;
-		relay.childIds.add(playerId);
+		if (relay) relay.childIds[channel].add(playerId);
 	}
 
-	_findBestRelay() {
+	// Find relay with fewest children on a specific channel, excluding already-used relays
+	_findBestRelayForChannel(channel, excludeSet) {
 		let best = null;
 		let bestCount = Infinity;
 		for (const relayId of this.relayIds) {
+			if (excludeSet && excludeSet.has(relayId)) continue;
 			const relay = this.nodes.get(relayId);
 			if (!relay) continue;
-			if (relay.childIds.size < RELAY_CAPACITY && relay.childIds.size < bestCount) {
+			const count = relay.childIds[channel].size;
+			if (count < RELAY_CAPACITY && count < bestCount) {
 				best = relayId;
-				bestCount = relay.childIds.size;
+				bestCount = count;
 			}
 		}
 		return best;
@@ -178,50 +219,46 @@ class RelayTree {
 
 		const idealRelayCount = Math.max(1, Math.ceil(Math.sqrt(total)));
 
-		// Check if any current relay should be demoted (low score, mobile came online)
-		// and if any leaf has a much better score
 		if (this.relayIds.size >= idealRelayCount) {
 			this._maybeSwapRelays();
 		}
 
-		// Promote more relays if needed (pick highest scoring candidates)
+		// Promote more relays if needed
 		if (this.relayIds.size < idealRelayCount) {
 			const now = Date.now();
 			const candidates = [];
 			for (const [id, node] of this.nodes) {
-				if (
-					node.role !== "relay" &&
-					(now - node.joinTime) > MIN_AGE_FOR_RELAY_MS
-				) {
+				if (node.role !== "relay" && (now - node.joinTime) > MIN_AGE_FOR_RELAY_MS) {
 					candidates.push({ id, score: node.relayScore });
 				}
 			}
-			// Best candidates first
 			candidates.sort((a, b) => b.score - a.score);
-
 			for (const c of candidates) {
 				if (this.relayIds.size >= idealRelayCount) break;
-				const node = this.nodes.get(c.id);
-				if (node.relayParentId) {
-					const oldRelay = this.nodes.get(node.relayParentId);
-					if (oldRelay) oldRelay.childIds.delete(c.id);
-				}
 				this._promoteToRelay(c.id);
 			}
 		}
 
-		// Reassign orphaned/unassigned leaf nodes
+		// Reassign leaves with missing relay channels
 		for (const [id, node] of this.nodes) {
-			if (node.role === "orphan" || (node.role === "leaf" && !node.relayParentId)) {
-				const relayId = this._findBestRelay();
-				if (relayId && relayId !== id) {
-					this._assignToRelay(id, relayId);
+			if (node.role !== "leaf" && node.role !== "orphan") continue;
+			let changed = false;
+			const usedRelays = new Set(node.relayParentIds.filter(Boolean));
+			for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+				if (node.relayParentIds[ch] === null) {
+					const relayId = this._findBestRelayForChannel(ch, usedRelays);
+					if (relayId && relayId !== id) {
+						node.relayParentIds[ch] = relayId;
+						this._assignToRelayChannel(id, relayId, ch);
+						usedRelays.add(relayId);
+						changed = true;
+					}
 				}
 			}
+			if (changed && node.role === "orphan") node.role = "leaf";
 		}
 	}
 
-	// Swap a low-scoring relay with a high-scoring leaf if the difference is large
 	_maybeSwapRelays() {
 		let worstRelay = null;
 		let worstScore = Infinity;
@@ -237,51 +274,45 @@ class RelayTree {
 		let bestScore = -Infinity;
 		const now = Date.now();
 		for (const [id, node] of this.nodes) {
-			if (
-				node.role === "leaf" &&
-				(now - node.joinTime) > MIN_AGE_FOR_RELAY_MS &&
-				node.relayScore > bestScore
-			) {
+			if (node.role === "leaf" && (now - node.joinTime) > MIN_AGE_FOR_RELAY_MS && node.relayScore > bestScore) {
 				bestLeaf = id;
 				bestScore = node.relayScore;
 			}
 		}
 
-		// Only swap if the leaf is significantly better (>20 points)
 		if (worstRelay && bestLeaf && bestScore - worstScore > 20) {
-			console.log(
-				`Relay swap: demoting ${worstRelay} (score ${worstScore.toFixed(0)}) ` +
-				`for ${bestLeaf} (score ${bestScore.toFixed(0)})`
-			);
+			console.log(`Relay swap: ${worstRelay} (${worstScore.toFixed(0)}) → ${bestLeaf} (${bestScore.toFixed(0)})`);
 
-			// Demote the relay — orphan its children
 			const oldRelay = this.nodes.get(worstRelay);
-			for (const childId of oldRelay.childIds) {
-				const child = this.nodes.get(childId);
-				if (child) {
-					child.relayParentId = null;
-					child.role = "orphan";
+			for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+				for (const childId of oldRelay.childIds[ch]) {
+					const child = this.nodes.get(childId);
+					if (child) child.relayParentIds[ch] = null;
 				}
+				oldRelay.childIds[ch].clear();
 			}
-			oldRelay.childIds.clear();
 			oldRelay.role = "orphan";
 			this.relayIds.delete(worstRelay);
 
-			// Promote the leaf
-			const newRelay = this.nodes.get(bestLeaf);
-			if (newRelay.relayParentId) {
-				const parent = this.nodes.get(newRelay.relayParentId);
-				if (parent) parent.childIds.delete(bestLeaf);
-			}
 			this._promoteToRelay(bestLeaf);
 		}
 	}
 
 	getStats() {
+		let totalChildren = 0;
+		for (const relayId of this.relayIds) {
+			const node = this.nodes.get(relayId);
+			if (node) {
+				for (let ch = 0; ch < NUM_CHANNELS; ch++) {
+					totalChildren += node.childIds[ch].size;
+				}
+			}
+		}
 		return {
 			total: this.nodes.size,
 			relays: this.relayIds.size,
 			leaves: this.nodes.size - this.relayIds.size,
+			totalRelayLinks: totalChildren, // Each leaf has up to 3 links
 		};
 	}
 }

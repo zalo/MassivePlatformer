@@ -83,25 +83,66 @@ setInterval(() => {
 	}
 }, 10000);
 
-// --- Network broadcast (15hz) ---
+// --- Network broadcast (15hz total, split across 3 channels at 5hz each) ---
+// Channels A/B/C are staggered: tick 0→A, tick 1→B, tick 2→C, tick 3→A, ...
+// Full snapshots are sent to ALL 3 channels simultaneously.
 // Packet format:
-//   [type:u8, seq:u8, count:u16, ...players(id:u16, x:f32, y:f32, flags:u8), signature:64B]
+//   [type:u8, seq:u8, channel:u8, count:u16, ...players(...), signature:64B]
 // type 0 = full snapshot (resets seq to 0), type 1 = delta
-// seq = 0-255, wraps. Reset to 0 on each full snapshot.
-// Signature: Ed25519 over the payload (everything before the signature).
+// channel = 0/1/2 (A/B/C) — lets clients know which stream this is
 const NET_RATE = 15;
+const NUM_CHANNELS = 3;
 const PLAYER_SIZE = 11;
-const HEADER_SIZE = 4; // type(1) + seq(1) + count(2)
-const FULL_SNAPSHOT_INTERVAL = 3 * NET_RATE;
+const HEADER_SIZE = 5; // type(1) + seq(1) + channel(1) + count(2)
+const FULL_SNAPSHOT_INTERVAL = 3 * NET_RATE; // Every 3 seconds (45 ticks)
 const POSITION_THRESHOLD = 0.3;
 
 const lastSentState = new Map();
 let ticksSinceFullSnapshot = 0;
 let seqNumber = 0;
+let netTick = 0;
 let debugCounter = 0;
+
+function buildStatePacket(type, seq, channelIdx, toSend, removed) {
+	const totalEntries = toSend.length + removed.length;
+	const payloadSize = HEADER_SIZE + totalEntries * PLAYER_SIZE;
+	const buf = Buffer.alloc(payloadSize + SIG_SIZE);
+
+	buf.writeUInt8(type, 0);
+	buf.writeUInt8(seq, 1);
+	buf.writeUInt8(channelIdx, 2);
+	buf.writeUInt16LE(totalEntries, 3);
+
+	let offset = HEADER_SIZE;
+	for (const p of toSend) {
+		const flags = p.grounded ? 1 : 0;
+		buf.writeUInt16LE(p.id, offset);
+		buf.writeFloatLE(p.x, offset + 2);
+		buf.writeFloatLE(p.y, offset + 6);
+		buf.writeUInt8(flags, offset + 10);
+		offset += PLAYER_SIZE;
+	}
+	for (const id of removed) {
+		buf.writeUInt16LE(id, offset);
+		buf.writeFloatLE(0, offset + 2);
+		buf.writeFloatLE(0, offset + 4);
+		buf.writeUInt8(2, offset + 6);
+		offset += PLAYER_SIZE;
+	}
+
+	// Sign
+	const payload = buf.subarray(0, payloadSize);
+	const sig = crypto.sign(null, payload, SIGN_PRIVATE);
+	sig.copy(buf, payloadSize);
+
+	return buf.subarray(0, payloadSize + SIG_SIZE);
+}
 
 setInterval(() => {
 	if (!bridgeReady) return;
+
+	const channelIdx = netTick % NUM_CHANNELS;
+	netTick++;
 
 	const playerList = world.getPlayers();
 	const isFull =
@@ -147,43 +188,27 @@ setInterval(() => {
 	const totalEntries = toSend.length + removed.length;
 	if (totalEntries === 0 && !isFull) return;
 
-	const payloadSize = HEADER_SIZE + totalEntries * PLAYER_SIZE;
-	const buf = Buffer.alloc(payloadSize + SIG_SIZE);
-
-	// Header
-	buf.writeUInt8(isFull ? 0 : 1, 0);
-	buf.writeUInt8(seqNumber, 1);
-	buf.writeUInt16LE(totalEntries, 2);
-
-	// Player entries
-	let offset = HEADER_SIZE;
+	// Update lastSentState
 	for (const p of toSend) {
-		const flags = p.grounded ? 1 : 0;
-		buf.writeUInt16LE(p.id, offset);
-		buf.writeFloatLE(p.x, offset + 2);
-		buf.writeFloatLE(p.y, offset + 6);
-		buf.writeUInt8(flags, offset + 10);
-		offset += PLAYER_SIZE;
-		lastSentState.set(p.id, { x: p.x, y: p.y, flags });
-	}
-	for (const id of removed) {
-		buf.writeUInt16LE(id, offset);
-		buf.writeFloatLE(0, offset + 2);
-		buf.writeFloatLE(0, offset + 4);
-		buf.writeUInt8(2, offset + 6);
-		offset += PLAYER_SIZE;
+		lastSentState.set(p.id, { x: p.x, y: p.y, flags: p.grounded ? 1 : 0 });
 	}
 
-	// Sign the payload (everything before signature)
-	const payload = buf.subarray(0, payloadSize);
-	const sig = crypto.sign(null, payload, SIGN_PRIVATE);
-	sig.copy(buf, payloadSize);
+	if (isFull) {
+		// Full snapshots go to ALL 3 channels simultaneously
+		for (let i = 0; i < NUM_CHANNELS; i++) {
+			const pkt = buildStatePacket(0, seqNumber, i, toSend, removed);
+			bridge.broadcastState(pkt, i);
+		}
+	} else {
+		// Deltas go to one channel (round-robin)
+		const pkt = buildStatePacket(1, seqNumber, channelIdx, toSend, removed);
+		bridge.broadcastState(pkt, channelIdx);
+	}
 
-	const sent = bridge.broadcastState(buf.subarray(0, payloadSize + SIG_SIZE));
 	if (playerList.length > 0 && debugCounter++ % NET_RATE === 0) {
 		const stats = relayTree.getStats();
 		console.log(
-			`Net: ${playerList.length} players, ${payloadSize + SIG_SIZE}B seq=${seqNumber} ${isFull ? "FULL" : "delta(" + toSend.length + ")"}, relays: ${stats.relays}, leaves: ${stats.leaves}`
+			`Net: ${playerList.length} players, seq=${seqNumber} ch=${channelIdx} ${isFull ? "FULL(x3)" : "delta(" + toSend.length + ")"}, relays: ${stats.relays}, leaves: ${stats.leaves}`
 		);
 	}
 }, 1000 / NET_RATE);
@@ -308,10 +333,13 @@ async function handleRegister(req, res) {
 			.catch((e) => console.error("Bridge subscribe error:", e));
 	}
 
-	// If this is a leaf with a P2P offer, store it for the relay to pick up
+	// If this is a leaf with P2P offers, store them for each relay to pick up
+	// p2pOffer is now an array: [{ channel, relayId, sdp }, ...]
 	const node = relayTree.getNode(playerId);
-	if (node && node.role === "leaf" && node.relayParentId && p2pOffer) {
-		relayTree.storeOffer(playerId, node.relayParentId, p2pOffer);
+	if (node && node.role === "leaf" && Array.isArray(p2pOffer)) {
+		for (const { channel, relayId, sdp } of p2pOffer) {
+			relayTree.storeOffer(playerId, relayId, channel, sdp);
+		}
 	}
 
 	console.log(`Player ${playerId} registered (${node?.role || "unknown"}, session: ${sessionId})`);
@@ -345,21 +373,21 @@ function handleRelayPending(req, res) {
 	res.end(JSON.stringify({ offers }));
 }
 
-// --- Relay sends P2P answer for a child ---
+// --- Relay sends P2P answer for a child (now includes channel) ---
 async function handleRelayAnswer(req, res) {
 	const body = await readBody(req);
-	const { childId, answer } = JSON.parse(body);
-	relayTree.storeAnswer(childId, answer);
+	const { childId, channel, answer } = JSON.parse(body);
+	relayTree.storeAnswer(childId, channel, answer);
 	res.writeHead(200, { "Content-Type": "application/json" });
 	res.end(JSON.stringify({ ok: true }));
 }
 
-// --- Child polls for P2P answer from relay ---
+// --- Child polls for P2P answers from relays (may have multiple) ---
 function handleGetRelayAnswer(req, res) {
 	const childId = parseInt(req.url.split("/").pop());
-	const answer = relayTree.getAnswer(childId);
+	const answers = relayTree.getAnswers(childId);
 	res.writeHead(200, { "Content-Type": "application/json" });
-	res.end(JSON.stringify({ answer }));
+	res.end(JSON.stringify({ answers }));
 }
 
 // --- Child checks if role changed (orphan -> reassigned) ---
