@@ -6,7 +6,6 @@ const PLAYER_RADIUS = 12;
 const INPUT_SEND_RATE = 50;
 const INPUT_HEARTBEAT_MS = 200; // Resend input every 200ms even if unchanged
 const STUN_SERVER = "stun:stun.cloudflare.com:3478";
-const EXTRAP_MAX_MS = 200; // Max extrapolation time before clamping
 
 // --- State ---
 let myPlayerId = null;
@@ -257,30 +256,16 @@ function handleStateUpdate(data) {
 	}
 }
 
-// Extrapolate a player's position based on velocity between last two snapshots
-function getExtrapolatedPos(p, now) {
-	const dt = p.updateTime - p.prevUpdateTime;
-	if (dt <= 0) return { x: p.x, y: p.y };
-
-	// Velocity from last two known positions
-	const vx = (p.x - p.prevX) / dt;
-	const vy = (p.y - p.prevY) / dt;
-
-	// How long since the last update
-	const elapsed = Math.min(now - p.updateTime, EXTRAP_MAX_MS);
-	if (elapsed <= 0) return { x: p.x, y: p.y };
-
-	return {
-		x: p.x + vx * elapsed,
-		y: p.y + vy * elapsed,
-	};
+// Use the latest server position directly — no extrapolation or interpolation
+function getDisplayPos(p) {
+	return { x: p.x, y: p.y };
 }
 
 // --- Rendering ---
 function getCamera() {
 	const me = playerMap.get(myPlayerId);
 	if (!me) return { x: 0, y: 0 };
-	const pos = getExtrapolatedPos(me, performance.now());
+	const pos = getDisplayPos(me);
 	return { x: pos.x - canvas.width / 2, y: pos.y - canvas.height / 2 };
 }
 
@@ -291,7 +276,6 @@ function render() {
 	ctx.fillRect(0, 0, canvas.width, canvas.height);
 	if (!map) { requestAnimationFrame(render); return; }
 
-	const now = performance.now();
 	const cam = getCamera();
 
 	ctx.fillStyle = "#16213e"; ctx.strokeStyle = "#0f3460"; ctx.lineWidth = 2;
@@ -302,7 +286,7 @@ function render() {
 	}
 
 	for (const [, p] of playerMap) {
-		const pos = getExtrapolatedPos(p, now);
+		const pos = getDisplayPos(p);
 		const sx = pos.x - cam.x, sy = pos.y - cam.y;
 		if (sx < -50 || sx > canvas.width + 50 || sy < -50 || sy > canvas.height + 50) continue;
 		const isMe = p.id === myPlayerId;
