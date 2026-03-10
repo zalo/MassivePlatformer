@@ -181,23 +181,68 @@ The deploy script handles the full pipeline:
 ## Project structure
 
 ```
-├── src/
-│   └── worker.ts              # Cloudflare Worker — routes to container
-├── container/
-│   ├── Dockerfile
+├── relay-lib/                   # Reusable networking library
+│   ├── server/
+│   │   ├── index.js             #   RelayServer — bridge, relay tree, HTTP, signing
+│   │   ├── bridge.js            #   WebRTC bridge (node-datachannel ↔ SFU)
+│   │   └── relay-tree.js        #   P2P relay tree (roles, scoring, rebalancing)
+│   └── client/
+│       └── relay-client.js      #   RelayClient — SFU, P2P relay/leaf, verification
+├── container/                   # Platformer game server
 │   ├── package.json
 │   └── src/
-│       ├── server.js          # HTTP server, physics tick, signaling
-│       ├── bridge.js          # WebRTC bridge (node-datachannel ↔ SFU)
-│       ├── relay-tree.js      # P2P relay tree manager (role assignment, signaling)
-│       ├── physics.js         # Platformer physics (circle vs AABB)
-│       └── map.js             # Level definition
-├── public/
-│   ├── index.html             # Game shell + touch controls
-│   └── game.js                # Client (Canvas + WebRTC)
-├── wrangler.toml              # Cloudflare deployment config
-├── deploy.sh                  # Build, push, deploy pipeline
+│       ├── server.js            #   Game server (uses relay-lib/server)
+│       ├── physics.js           #   Platformer physics (circle vs AABB)
+│       └── map.js               #   Level definition
+├── public/                      # Platformer client
+│   ├── index.html
+│   ├── relay-client.js          #   Copy of relay-lib/client (served as static)
+│   └── game.js                  #   Game client (uses CloudflareRelay.Client)
+├── src/
+│   └── worker.ts                # Cloudflare Worker — routes to container
+├── Dockerfile                   # Container image (project root for relay-lib access)
+├── wrangler.toml
+├── deploy.sh
 └── README.md
+```
+
+### Using the relay library
+
+The networking is split into a reusable library (`relay-lib/`) that any real-time application can use. The platformer is just one consumer.
+
+**Server (Node.js):**
+```js
+const { RelayServer } = require("relay-lib/server");
+
+const relay = new RelayServer({
+  callsAppId: "...", callsAppToken: "...",
+  netRate: 15, numChannels: 3,
+});
+
+relay.onPlayerJoin((id) => game.addPlayer(id));
+relay.onPlayerLeave((id) => game.removePlayer(id));
+relay.onPlayerInput((id, data) => game.handleInput(id, data));
+
+relay.configureState({
+  getEntries: () => game.getEntities(),
+  serialize: (buf, offset, entity) => { /* write entity to buffer */ },
+  entrySize: 11,
+  getPosition: (e) => ({ x: e.x, y: e.y }),
+  getFlags: (e) => e.flags,
+});
+
+await relay.start();
+```
+
+**Client (Browser):**
+```html
+<script src="relay-client.js"></script>
+<script>
+const client = new CloudflareRelay.Client();
+client.setInputProvider(() => new Uint8Array([inputBits]));
+client.onStateUpdate((payload) => { /* parse binary state */ });
+await client.connect();
+</script>
 ```
 
 ## Security: Calls API token

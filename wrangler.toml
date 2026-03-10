@@ -7,7 +7,7 @@ directory = "public"
 
 [[containers]]
 class_name = "GameContainer"
-image = "./container/Dockerfile"
+image = "./Dockerfile"
 max_instances = 5
 
 [[durable_objects.bindings]]
