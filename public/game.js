@@ -4,17 +4,25 @@ const INPUT_RIGHT = 2;
 const INPUT_JUMP = 4;
 const PLAYER_RADIUS = 12;
 const INPUT_SEND_RATE = 50;
-const INPUT_HEARTBEAT_MS = 200; // Resend input every 200ms even if unchanged
+const INPUT_HEARTBEAT_MS = 200;
 const STUN_SERVER = "stun:stun.cloudflare.com:3478";
-const EXTRAP_MAX_MS = 200; // Max extrapolation time before clamping
+const RELAY_POLL_MS = 500; // How often relays poll for new children
 
 // --- State ---
 let myPlayerId = null;
+let myRole = null; // 'relay' or 'leaf'
 let map = null;
 let inputChannel = null;
-let stateChannel = null;
+let stateChannel = null; // SFU channel (relay always has this; leaf uses as fallback)
 let lastSentInput = -1;
 let lastSendTime = 0;
+
+// P2P relay state
+let relayParentPC = null; // Leaf's P2P connection to relay parent
+let relayParentDC = null; // Leaf's data channel from relay parent
+let relayChildPCs = new Map(); // Relay's P2P connections to children: childId -> { pc, dc }
+let relayPollTimer = null;
+let sfuFallback = false; // Leaf: true if using SFU directly (relay disconnected)
 
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
@@ -24,53 +32,34 @@ function resize() { canvas.width = innerWidth; canvas.height = innerHeight; }
 addEventListener("resize", resize);
 resize();
 
-// --- Keyboard input ---
+// --- Input ---
 const keys = {};
 addEventListener("keydown", (e) => { keys[e.code] = true; if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space"].includes(e.code)) e.preventDefault(); });
 addEventListener("keyup", (e) => { keys[e.code] = false; });
 
-// --- Touch input ---
 const touch = { left: false, right: false, jump: false };
-
 function setupTouchButton(id, field) {
 	const btn = document.getElementById(id);
 	if (!btn) return;
-
-	function activate(e) {
-		e.preventDefault();
-		touch[field] = true;
-		btn.classList.add("active");
-	}
-	function deactivate(e) {
-		e.preventDefault();
-		touch[field] = false;
-		btn.classList.remove("active");
-	}
-
+	function activate(e) { e.preventDefault(); touch[field] = true; btn.classList.add("active"); }
+	function deactivate(e) { e.preventDefault(); touch[field] = false; btn.classList.remove("active"); }
 	btn.addEventListener("touchstart", activate, { passive: false });
 	btn.addEventListener("touchend", deactivate, { passive: false });
 	btn.addEventListener("touchcancel", deactivate, { passive: false });
-
 	btn.addEventListener("touchmove", (e) => {
 		e.preventDefault();
 		const t = e.changedTouches[0];
 		const rect = btn.getBoundingClientRect();
-		const inside = t.clientX >= rect.left && t.clientX <= rect.right &&
-		               t.clientY >= rect.top && t.clientY <= rect.bottom;
-		touch[field] = inside;
-		btn.classList.toggle("active", inside);
+		const inside = t.clientX >= rect.left && t.clientX <= rect.right && t.clientY >= rect.top && t.clientY <= rect.bottom;
+		touch[field] = inside; btn.classList.toggle("active", inside);
 	}, { passive: false });
 }
-
 setupTouchButton("btn-left", "left");
 setupTouchButton("btn-right", "right");
 setupTouchButton("btn-up", "jump");
 setupTouchButton("btn-jump", "jump");
-
 addEventListener("contextmenu", (e) => e.preventDefault());
-addEventListener("touchstart", (e) => {
-	if (e.target === canvas) e.preventDefault();
-}, { passive: false });
+addEventListener("touchstart", (e) => { if (e.target === canvas) e.preventDefault(); }, { passive: false });
 
 function readInput() {
 	let s = 0;
@@ -80,16 +69,12 @@ function readInput() {
 	return s;
 }
 
-// --- Calls API proxy (token stays server-side) ---
+// --- Calls API proxy ---
 async function callsAPI(path, body) {
-	const opts = {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-	};
+	const opts = { method: "POST", headers: { "Content-Type": "application/json" } };
 	if (body) opts.body = JSON.stringify(body);
 	else delete opts.headers["Content-Type"];
-	const r = await fetch(`/api/calls${path}`, opts);
-	return r.json();
+	return (await fetch(`/api/calls${path}`, opts)).json();
 }
 
 // --- Join flow ---
@@ -101,16 +86,17 @@ async function join() {
 
 	myPlayerId = config.playerId;
 	map = config.map;
+	myRole = config.relay.role;
 	const { bridgeSessionId, inputChannelName } = config;
 
-	statusEl.textContent = "Connecting to SFU...";
+	statusEl.textContent = `Connecting (${myRole})...`;
 
+	// --- SFU connection (same for relay and leaf) ---
 	const pc = new RTCPeerConnection({
 		iceServers: [{ urls: STUN_SERVER }],
 		bundlePolicy: "max-bundle",
 	});
-
-	pc.onconnectionstatechange = () => console.log("PC:", pc.connectionState);
+	pc.onconnectionstatechange = () => console.log("SFU PC:", pc.connectionState);
 
 	const bootstrapDC = pc.createDataChannel("bootstrap");
 	bootstrapDC.onopen = () => bootstrapDC.close();
@@ -134,44 +120,118 @@ async function join() {
 		};
 	});
 
-	console.log("Connected! Setting up channels...");
-	statusEl.textContent = "Setting up channels...";
+	console.log("SFU connected, setting up channels...");
 
+	// Input channel (all players publish input via SFU)
 	const inputResp = await callsAPI(
 		`/sessions/${sess.sessionId}/datachannels/new`,
 		{ dataChannels: [{ location: "local", dataChannelName: inputChannelName }] }
 	);
-
-	const stateResp = await callsAPI(
-		`/sessions/${sess.sessionId}/datachannels/new`,
-		{ dataChannels: [{ location: "remote", sessionId: bridgeSessionId, dataChannelName: "game-state" }] }
-	);
-	stateChannel = pc.createDataChannel("game-state-sub", {
-		negotiated: true,
-		id: stateResp.dataChannels[0].id,
-		ordered: false,
-		maxRetransmits: 0,
-	});
-	stateChannel.binaryType = "arraybuffer";
-	stateChannel.onopen = () => console.log("State channel open");
-	stateChannel.onmessage = (evt) => handleStateUpdate(evt.data);
-
 	inputChannel = pc.createDataChannel(inputChannelName, {
-		negotiated: true,
-		id: inputResp.dataChannels[0].id,
-		ordered: false,
-		maxRetransmits: 0,
+		negotiated: true, id: inputResp.dataChannels[0].id,
+		ordered: false, maxRetransmits: 0,
 	});
 	inputChannel.binaryType = "arraybuffer";
 	inputChannel.onopen = () => console.log("Input channel open");
 
+	// Game state channel via SFU
+	// Relay: always subscribes (source of truth, forwards to children)
+	// Leaf: subscribes as fallback (used until P2P relay connects)
+	if (myRole === "relay" || myRole === "leaf") {
+		const stateResp = await callsAPI(
+			`/sessions/${sess.sessionId}/datachannels/new`,
+			{ dataChannels: [{ location: "remote", sessionId: bridgeSessionId, dataChannelName: "game-state" }] }
+		);
+		stateChannel = pc.createDataChannel("game-state-sub", {
+			negotiated: true, id: stateResp.dataChannels[0].id,
+			ordered: false, maxRetransmits: 0,
+		});
+		stateChannel.binaryType = "arraybuffer";
+		stateChannel.onopen = () => console.log("SFU state channel open");
+		stateChannel.onmessage = (evt) => handleSFUState(evt.data);
+
+		if (myRole === "leaf") {
+			sfuFallback = true; // Use SFU until P2P relay connects
+		}
+	}
+
+	// --- P2P offer for leaf nodes ---
+	let p2pOffer = null;
+	if (myRole === "leaf" && config.relay.relayParentId) {
+		// Create P2P PeerConnection to relay parent
+		relayParentPC = new RTCPeerConnection({
+			iceServers: [{ urls: STUN_SERVER }],
+		});
+		relayParentPC.onconnectionstatechange = () => {
+			console.log("Relay P2P:", relayParentPC.connectionState);
+			if (relayParentPC.connectionState === "failed" || relayParentPC.connectionState === "disconnected") {
+				console.log("Relay P2P lost, falling back to SFU");
+				sfuFallback = true;
+			}
+		};
+
+		// Create the data channel that relay will send state on
+		relayParentDC = relayParentPC.createDataChannel("relay-state", {
+			ordered: false, maxRetransmits: 0,
+		});
+		relayParentDC.binaryType = "arraybuffer";
+		relayParentDC.onopen = () => {
+			console.log("P2P relay channel open — switching off SFU fallback");
+			sfuFallback = false;
+		};
+		relayParentDC.onmessage = (evt) => handleStateUpdate(evt.data);
+
+		// Also listen for incoming data channels (relay creates the channel)
+		relayParentPC.ondatachannel = (evt) => {
+			console.log("P2P incoming channel:", evt.channel.label);
+			const dc = evt.channel;
+			dc.binaryType = "arraybuffer";
+			dc.onopen = () => {
+				console.log("P2P relay channel open (incoming) — switching off SFU fallback");
+				sfuFallback = false;
+				relayParentDC = dc;
+			};
+			dc.onmessage = (evt) => handleStateUpdate(evt.data);
+		};
+
+		const p2pOfferDesc = await relayParentPC.createOffer();
+		await relayParentPC.setLocalDescription(p2pOfferDesc);
+
+		// Wait for ICE gathering
+		await new Promise((resolve) => {
+			if (relayParentPC.iceGatheringState === "complete") return resolve();
+			relayParentPC.onicegatheringstatechange = () => {
+				if (relayParentPC.iceGatheringState === "complete") resolve();
+			};
+		});
+
+		p2pOffer = relayParentPC.localDescription.sdp;
+	}
+
+	// --- Register with game server ---
 	await fetch("/api/register", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ playerId: myPlayerId, sessionId: sess.sessionId, inputChannelName }),
+		body: JSON.stringify({
+			playerId: myPlayerId,
+			sessionId: sess.sessionId,
+			inputChannelName,
+			p2pOffer,
+		}),
 	});
 
-	statusEl.textContent = `Player ${myPlayerId} — Playing!`;
+	// --- Leaf: poll for P2P answer from relay ---
+	if (myRole === "leaf" && p2pOffer) {
+		pollForRelayAnswer();
+	}
+
+	// --- Relay: poll for new children ---
+	if (myRole === "relay") {
+		relayPollTimer = setInterval(pollForChildren, RELAY_POLL_MS);
+	}
+
+	const roleLabel = myRole === "relay" ? "RELAY" : "LEAF";
+	statusEl.textContent = `Player ${myPlayerId} [${roleLabel}]`;
 	setInterval(sendInput, 1000 / INPUT_SEND_RATE);
 
 	addEventListener("beforeunload", () => {
@@ -179,11 +239,104 @@ async function join() {
 	});
 }
 
+// --- SFU state handler: relay forwards, leaf uses as fallback ---
+function handleSFUState(data) {
+	if (myRole === "relay") {
+		// Forward to all P2P children
+		for (const [childId, { dc }] of relayChildPCs) {
+			if (dc && dc.readyState === "open") {
+				try { dc.send(data); } catch (e) {}
+			}
+		}
+		// Also apply locally
+		handleStateUpdate(data);
+	} else if (sfuFallback) {
+		// Leaf using SFU as fallback
+		handleStateUpdate(data);
+	}
+	// If leaf with active P2P, ignore SFU data (P2P is the source)
+}
+
+// --- Relay: poll for pending child offers ---
+async function pollForChildren() {
+	try {
+		const resp = await (await fetch(`/api/relay-pending?relayId=${myPlayerId}`)).json();
+		for (const { childId, sdp } of resp.offers) {
+			console.log(`Relay: new child ${childId}, creating P2P answer`);
+			await acceptChild(childId, sdp);
+		}
+	} catch (e) {
+		console.error("Relay poll error:", e);
+	}
+}
+
+// --- Relay: accept a child's P2P offer ---
+async function acceptChild(childId, offerSdp) {
+	const childPC = new RTCPeerConnection({
+		iceServers: [{ urls: STUN_SERVER }],
+	});
+
+	childPC.onconnectionstatechange = () => {
+		console.log(`Relay->Child ${childId} PC:`, childPC.connectionState);
+		if (childPC.connectionState === "failed" || childPC.connectionState === "disconnected") {
+			relayChildPCs.delete(childId);
+			childPC.close();
+		}
+	};
+
+	// Create data channel for sending state to child
+	const dc = childPC.createDataChannel("relay-state", {
+		ordered: false, maxRetransmits: 0,
+	});
+	dc.binaryType = "arraybuffer";
+	dc.onopen = () => console.log(`Relay: P2P channel to child ${childId} open`);
+
+	await childPC.setRemoteDescription({ type: "offer", sdp: offerSdp });
+	const answer = await childPC.createAnswer();
+	await childPC.setLocalDescription(answer);
+
+	// Wait for ICE gathering
+	await new Promise((resolve) => {
+		if (childPC.iceGatheringState === "complete") return resolve();
+		childPC.onicegatheringstatechange = () => {
+			if (childPC.iceGatheringState === "complete") resolve();
+		};
+	});
+
+	// Send answer to server
+	await fetch("/api/relay-answer", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			childId,
+			answer: childPC.localDescription.sdp,
+		}),
+	});
+
+	relayChildPCs.set(childId, { pc: childPC, dc });
+}
+
+// --- Leaf: poll for P2P answer from relay ---
+async function pollForRelayAnswer() {
+	for (let i = 0; i < 20; i++) { // Try for 10 seconds
+		try {
+			const resp = await (await fetch(`/api/relay-answer/${myPlayerId}`)).json();
+			if (resp.answer) {
+				console.log("Got P2P answer from relay");
+				await relayParentPC.setRemoteDescription({ type: "answer", sdp: resp.answer });
+				return;
+			}
+		} catch (e) {}
+		await new Promise((r) => setTimeout(r, RELAY_POLL_MS));
+	}
+	console.log("No P2P answer received — staying on SFU fallback");
+}
+
+// --- Input send ---
 function sendInput() {
 	if (!inputChannel || inputChannel.readyState !== "open") return;
 	const s = readInput();
 	const now = performance.now();
-	// Send if changed OR heartbeat interval elapsed (protects against lost packets)
 	if (s !== lastSentInput || (now - lastSendTime) >= INPUT_HEARTBEAT_MS) {
 		inputChannel.send(new Uint8Array([s]));
 		lastSentInput = s;
@@ -191,97 +344,54 @@ function sendInput() {
 	}
 }
 
-// --- Player state with extrapolation ---
-// Each player stores two snapshots for velocity estimation
-// { id, x, y, grounded, prevX, prevY, updateTime, prevUpdateTime }
+// --- Player state ---
 const playerMap = new Map();
 
 function handleStateUpdate(data) {
-	const buf = new DataView(data);
+	const buf = new DataView(data instanceof ArrayBuffer ? data : data.buffer || data);
 	const type = buf.getUint8(0);
 	const count = buf.getUint16(1, true);
 	const PS = 11;
-	const now = performance.now();
 
 	if (type === 0) {
-		// Full snapshot — mark all existing as stale, then update
 		const seen = new Set();
 		for (let i = 0; i < count; i++) {
 			const o = 3 + i * PS;
 			const id = buf.getUint16(o, true);
 			const flags = buf.getUint8(o + 10);
 			if (flags & 2) { playerMap.delete(id); continue; }
-
-			const nx = buf.getFloat32(o + 2, true);
-			const ny = buf.getFloat32(o + 6, true);
-			const existing = playerMap.get(id);
-
 			playerMap.set(id, {
 				id,
-				x: nx, y: ny,
+				x: buf.getFloat32(o + 2, true),
+				y: buf.getFloat32(o + 6, true),
 				grounded: (flags & 1) === 1,
-				prevX: existing ? existing.x : nx,
-				prevY: existing ? existing.y : ny,
-				updateTime: now,
-				prevUpdateTime: existing ? existing.updateTime : now,
 			});
 			seen.add(id);
 		}
-		// Remove players not in full snapshot
 		for (const [id] of playerMap) {
 			if (!seen.has(id)) playerMap.delete(id);
 		}
 	} else {
-		// Delta — update only included players
 		for (let i = 0; i < count; i++) {
 			const o = 3 + i * PS;
 			const id = buf.getUint16(o, true);
 			const flags = buf.getUint8(o + 10);
-
 			if (flags & 2) { playerMap.delete(id); continue; }
-
-			const nx = buf.getFloat32(o + 2, true);
-			const ny = buf.getFloat32(o + 6, true);
-			const existing = playerMap.get(id);
-
 			playerMap.set(id, {
 				id,
-				x: nx, y: ny,
+				x: buf.getFloat32(o + 2, true),
+				y: buf.getFloat32(o + 6, true),
 				grounded: (flags & 1) === 1,
-				prevX: existing ? existing.x : nx,
-				prevY: existing ? existing.y : ny,
-				updateTime: now,
-				prevUpdateTime: existing ? existing.updateTime : now,
 			});
 		}
 	}
-}
-
-// Extrapolate a player's position based on velocity between last two snapshots
-function getExtrapolatedPos(p, now) {
-	const dt = p.updateTime - p.prevUpdateTime;
-	if (dt <= 0) return { x: p.x, y: p.y };
-
-	// Velocity from last two known positions
-	const vx = (p.x - p.prevX) / dt;
-	const vy = (p.y - p.prevY) / dt;
-
-	// How long since the last update
-	const elapsed = Math.min(now - p.updateTime, EXTRAP_MAX_MS);
-	if (elapsed <= 0) return { x: p.x, y: p.y };
-
-	return {
-		x: p.x + vx * elapsed,
-		y: p.y + vy * elapsed,
-	};
 }
 
 // --- Rendering ---
 function getCamera() {
 	const me = playerMap.get(myPlayerId);
 	if (!me) return { x: 0, y: 0 };
-	const pos = getExtrapolatedPos(me, performance.now());
-	return { x: pos.x - canvas.width / 2, y: pos.y - canvas.height / 2 };
+	return { x: me.x - canvas.width / 2, y: me.y - canvas.height / 2 };
 }
 
 function playerColor(id) { return `hsl(${(id * 137.508) % 360}, 70%, 60%)`; }
@@ -291,7 +401,6 @@ function render() {
 	ctx.fillRect(0, 0, canvas.width, canvas.height);
 	if (!map) { requestAnimationFrame(render); return; }
 
-	const now = performance.now();
 	const cam = getCamera();
 
 	ctx.fillStyle = "#16213e"; ctx.strokeStyle = "#0f3460"; ctx.lineWidth = 2;
@@ -302,8 +411,7 @@ function render() {
 	}
 
 	for (const [, p] of playerMap) {
-		const pos = getExtrapolatedPos(p, now);
-		const sx = pos.x - cam.x, sy = pos.y - cam.y;
+		const sx = p.x - cam.x, sy = p.y - cam.y;
 		if (sx < -50 || sx > canvas.width + 50 || sy < -50 || sy > canvas.height + 50) continue;
 		const isMe = p.id === myPlayerId;
 		ctx.beginPath(); ctx.arc(sx, sy, PLAYER_RADIUS, 0, Math.PI * 2);
@@ -317,8 +425,13 @@ function render() {
 	ctx.fillStyle = "#e94560"; ctx.font = "12px monospace"; ctx.textAlign = "center";
 	ctx.fillText("SPAWN", map.spawn.x - cam.x, map.spawn.y - 20 - cam.y);
 
+	// HUD
 	ctx.fillStyle = "#888"; ctx.font = "12px monospace"; ctx.textAlign = "right";
 	ctx.fillText(`Players: ${playerMap.size}`, canvas.width - 10, 20);
+	const roleLabel = myRole === "relay"
+		? `RELAY (${relayChildPCs.size} children)`
+		: sfuFallback ? "LEAF (SFU fallback)" : "LEAF (P2P)";
+	ctx.fillText(roleLabel, canvas.width - 10, 36);
 
 	requestAnimationFrame(render);
 }

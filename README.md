@@ -8,38 +8,41 @@ A massively multiplayer 2D side-scrolling platformer where hundreds of players a
 
 ```
                           Cloudflare Network
-┌─────────────────────────────────────────────────────────┐
-│                                                         │
-│   Worker (edge)           Container (Firecracker VM)    │
-│   ┌──────────────┐       ┌──────────────────────────┐   │
-│   │ Routes /api/* ├──────►│ Node.js game server      │   │
-│   │ Serves static │       │ ┌──────────┐ ┌────────┐ │   │
-│   └──────────────┘       │ │ Physics  │ │ Bridge │ │   │
-│                          │ │  50hz    │ │ (WebRTC)│ │   │
-│                          │ └──────────┘ └───┬────┘ │   │
-│                          └──────────────────┼──────┘   │
-│                                             │          │
-│                          Realtime SFU       │          │
-│                          ┌──────────────────┴──────┐   │
-│                          │  Anycast WebRTC CDN     │   │
-│                          │  330+ edge locations    │   │
-│                          │  Cascading tree fanout  │   │
-│                          └────┬───┬───┬───┬───┬──┘   │
-│                               │   │   │   │   │      │
-└───────────────────────────────┼───┼───┼───┼───┼──────┘
-                                │   │   │   │   │
-                          Players (browsers, mobile)
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│  Worker (edge)            Container (Firecracker VM)         │
+│  ┌──────────────┐        ┌──────────────────────────────┐    │
+│  │ Routes /api/* ├───────►│ Node.js game server          │    │
+│  │ Serves static │        │ ┌────────┐ ┌──────┐ ┌─────┐ │    │
+│  └──────────────┘        │ │Physics │ │Bridge│ │Relay│ │    │
+│                           │ │ 45hz   │ │(SFU) │ │Tree │ │    │
+│                           │ └────────┘ └──┬───┘ └─────┘ │    │
+│                           └───────────────┼─────────────┘    │
+│                                           │                  │
+│                        Realtime SFU       │                  │
+│                        ┌──────────────────┴──────┐           │
+│                        │  Anycast WebRTC CDN     │           │
+│                        └──┬──────────────┬───┬──┘           │
+│                           │              │   │               │
+└───────────────────────────┼──────────────┼───┼───────────────┘
+                            │              │   │
+                      Relay nodes    (input channels)
+                       ┌────┴────┐         │
+                   P2P │  Direct │ P2P     │
+                   ┌───┘  WebRTC └───┐     │
+                   │                 │     │
+              Leaf players     Leaf players
 ```
 
 ### How it works
 
-1. **Player connects**: Browser creates a WebRTC PeerConnection to Cloudflare's Realtime SFU (Selective Forwarding Unit). No connection to the game server — just the SFU.
+1. **Player connects**: Browser creates a WebRTC PeerConnection to Cloudflare's Realtime SFU. All players publish input (1 byte) via SFU data channels to the bridge.
 
-2. **Input flows up**: Player keyboard/touch input (1 byte) travels through an unreliable WebRTC data channel to the SFU, which forwards it to the bridge's subscription.
+2. **Physics runs centrally**: The game server runs server-authoritative physics at 45hz — gravity, movement, platform collision for every player.
 
-3. **Physics runs centrally**: The game server in the Cloudflare Container runs server-authoritative physics at 45hz — gravity, movement, platform collision for every player.
+3. **State fans out via P2P relay tree**: The bridge publishes delta-compressed state at 15hz to a single SFU data channel. A small number of **relay nodes** (≈√N players) subscribe to this channel via the SFU. Each relay then forwards state to its assigned **leaf nodes** over direct P2P WebRTC data channels — bypassing the SFU entirely.
 
-4. **State fans out at 15hz**: The bridge publishes delta-compressed state updates on a single data channel 15 times per second (with full snapshots every 3 seconds for loss recovery). The SFU's cascading tree architecture replicates each update to every connected player. The bridge sends one copy; the SFU handles thousands.
+4. **Automatic fallback**: Leaf nodes that lose their P2P relay connection fall back to receiving state directly from the SFU until reassigned. Full snapshots every 3 seconds ensure recovery from any lost data.
 
 ### Why this architecture
 
@@ -67,27 +70,28 @@ This is where it gets interesting. The architecture inverts the typical cost mod
 |-----------|------------|------------------|
 | Container | CPU time at 45hz | ~Fixed regardless of player count |
 | SFU ingress | Bridge → SFU (1 stream) | Free (Cloudflare doesn't charge ingress) |
-| SFU egress | SFU → all players | Linear with player count, but per-byte |
+| SFU egress | SFU → relay nodes only | √N scaling (not linear) thanks to P2P relay tree |
+| P2P relay | Relay → leaf players | Free (direct WebRTC, no SFU) |
 | Calls API | Session management | Only at join/leave, not during gameplay |
 
-**The SFU egress is the only meaningful variable cost**, at $0.05/GB after 1TB free/month. And it's proportional to *data sent*, not connections held. Delta compression means stationary players cost zero egress.
+**SFU egress scales with √N, not N.** The P2P relay tree means only √N relay nodes subscribe to the SFU. Each relay forwards state to ~√N leaf players over direct P2P WebRTC connections that don't touch the SFU.
 
 #### Example: 500 concurrent players
 
 | Item | Calculation | Monthly cost |
 |------|------------|--------------|
 | Container (lite) | 256MB, 1/16 vCPU, 24/7 | ~$7 |
-| SFU egress | ~50 MB/s × 86400s × 30d | ~$6,500 |
-| With delta compression | ~80% stationary at any time | ~$1,300 |
-| With spatial culling | Send only ~50 nearby players | ~$130 |
+| SFU egress (no relay) | 500 subs × ~1.7KB × 15hz | ~$6,500 |
+| **SFU egress (with relay)** | **~22 relay subs × ~1.7KB × 15hz** | **~$290** |
+| P2P relay bandwidth | ~37 KB/s upload per relay node | Free (peer-to-peer) |
 
-The container is a rounding error. SFU egress dominates but responds directly to optimization — every byte you shave from the state packet multiplies across every player every tick.
+The P2P relay tree reduces SFU egress by **~95%**. Each relay node contributes ~37 KB/s of upload bandwidth — invisible on any broadband connection. Leaf nodes that lose their relay fall back to the SFU temporarily (full snapshots every 3 seconds provide recovery).
 
 #### Comparison to traditional hosting
 
 A traditional game server at 500 players would need careful WebSocket management, likely multiple server instances with load balancing, sticky sessions, and state synchronization between instances. Cost: $50-200/month for compute, but engineering complexity is high.
 
-This architecture: one container, one connection, linear egress cost, zero connection management. The SFU is a managed service — you don't operate it, scale it, or think about it.
+This architecture: one container, one connection, √N SFU egress, zero connection management. The SFU is a managed service — you don't operate it, scale it, or think about it.
 
 ## Binary protocol
 
@@ -176,6 +180,7 @@ The deploy script handles the full pipeline:
 │   └── src/
 │       ├── server.js          # HTTP server, physics tick, signaling
 │       ├── bridge.js          # WebRTC bridge (node-datachannel ↔ SFU)
+│       ├── relay-tree.js      # P2P relay tree manager (role assignment, signaling)
 │       ├── physics.js         # Platformer physics (circle vs AABB)
 │       └── map.js             # Level definition
 ├── public/

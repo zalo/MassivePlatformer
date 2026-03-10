@@ -14,6 +14,7 @@ try {
 
 const { GameWorld } = require("./physics");
 const { MAP } = require("./map");
+const { RelayTree } = require("./relay-tree");
 
 const MIME_TYPES = {
 	".html": "text/html",
@@ -26,8 +27,8 @@ const CALLS_APP_ID = process.env.CALLS_APP_ID;
 const CALLS_APP_TOKEN = process.env.CALLS_APP_TOKEN;
 const CALLS_API = `https://rtc.live.cloudflare.com/v1/apps/${CALLS_APP_ID}`;
 const PORT = 8080;
-const TICK_RATE = 45; // Hz (3x the 15hz network rate)
-const PLAYER_TIMEOUT_MS = 60 * 1000; // Remove players after 60 seconds of no input
+const TICK_RATE = 45;
+const PLAYER_TIMEOUT_MS = 60 * 1000;
 
 if (!CALLS_APP_ID || !CALLS_APP_TOKEN) {
 	console.error("Missing CALLS_APP_ID or CALLS_APP_TOKEN — running in degraded mode");
@@ -36,13 +37,13 @@ if (!CALLS_APP_ID || !CALLS_APP_TOKEN) {
 // --- Game state ---
 const world = new GameWorld(MAP);
 const bridge = bridgeAvailable ? new Bridge(CALLS_API, CALLS_APP_TOKEN) : null;
+const relayTree = new RelayTree();
 let bridgeReady = false;
 let nextPlayerId = 1;
 
-// Map of playerId -> { sessionId, inputChannelName, lastInputTime }
+// playerId -> { sessionId, inputChannelName }
 const players = new Map();
 
-// --- Initialize bridge session ---
 async function initBridge() {
 	await bridge.init();
 	world.setBridge(bridge);
@@ -62,27 +63,23 @@ setInterval(() => {
 	const now = Date.now();
 	for (const [playerId, player] of players) {
 		const lastInput = bridge.getLastInputTime(playerId);
-		// Only timeout players who have registered (lastInput > 0) and gone silent
 		if (lastInput > 0 && (now - lastInput) > PLAYER_TIMEOUT_MS) {
-			console.log(`Player ${playerId} timed out (no input for ${Math.round((now - lastInput) / 1000)}s)`);
+			console.log(`Player ${playerId} timed out`);
 			world.removePlayer(playerId);
 			bridge.unsubscribePlayer(playerId);
+			relayTree.removePlayer(playerId);
 			players.delete(playerId);
 		}
 	}
 }, 10000);
 
-// --- Network broadcast (15hz, decoupled from physics) ---
-// Packet format:
-//   [type:u8, count:u16, ...players[id:u16, x:f32, y:f32, flags:u8]]
-// type 0 = full snapshot (all players), type 1 = delta (only changed/removed)
-// flags: bit 0 = grounded, bit 1 = removed (player left)
-const NET_RATE = 15; // Hz
-const PLAYER_SIZE = 11; // 2+4+4+1
-const FULL_SNAPSHOT_INTERVAL = 3 * NET_RATE; // Full snapshot every 3 seconds
-const POSITION_THRESHOLD = 0.3; // Min change in px to include in delta
+// --- Network broadcast (15hz) ---
+const NET_RATE = 15;
+const PLAYER_SIZE = 11;
+const FULL_SNAPSHOT_INTERVAL = 3 * NET_RATE;
+const POSITION_THRESHOLD = 0.3;
 
-const lastSentState = new Map(); // playerId -> { x, y, flags }
+const lastSentState = new Map();
 let ticksSinceFullSnapshot = 0;
 let debugCounter = 0;
 
@@ -95,7 +92,6 @@ setInterval(() => {
 		lastSentState.size === 0;
 	ticksSinceFullSnapshot = isFull ? 0 : ticksSinceFullSnapshot + 1;
 
-	// Determine which players changed
 	let toSend;
 	if (isFull) {
 		toSend = playerList;
@@ -115,7 +111,6 @@ setInterval(() => {
 		}
 	}
 
-	// Detect removed players
 	const currentIds = new Set(playerList.map((p) => p.id));
 	const removed = [];
 	for (const [id] of lastSentState) {
@@ -128,7 +123,6 @@ setInterval(() => {
 	const totalEntries = toSend.length + removed.length;
 	if (totalEntries === 0 && !isFull) return;
 
-	// Build packet: [type:u8, count:u16, ...entries]
 	const buf = Buffer.alloc(3 + totalEntries * PLAYER_SIZE);
 	buf.writeUInt8(isFull ? 0 : 1, 0);
 	buf.writeUInt16LE(totalEntries, 1);
@@ -147,21 +141,21 @@ setInterval(() => {
 		buf.writeUInt16LE(id, offset);
 		buf.writeFloatLE(0, offset + 2);
 		buf.writeFloatLE(0, offset + 4);
-		buf.writeUInt8(2, offset + 6); // flags bit 1 = removed
+		buf.writeUInt8(2, offset + 6);
 		offset += PLAYER_SIZE;
 	}
 
 	const sent = bridge.broadcastState(buf.subarray(0, offset));
 	if (playerList.length > 0 && debugCounter++ % NET_RATE === 0) {
+		const stats = relayTree.getStats();
 		console.log(
-			`Net: ${playerList.length} players, ${offset}B ${isFull ? "FULL" : "delta(" + toSend.length + " changed)"}, sent: ${sent}`
+			`Net: ${playerList.length} players, ${offset}B ${isFull ? "FULL" : "delta(" + toSend.length + ")"}, relays: ${stats.relays}, leaves: ${stats.leaves}`
 		);
 	}
 }, 1000 / NET_RATE);
 
 // --- HTTP server ---
 const server = http.createServer(async (req, res) => {
-	// CORS
 	res.setHeader("Access-Control-Allow-Origin", "*");
 	res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
 	res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -173,21 +167,29 @@ const server = http.createServer(async (req, res) => {
 	}
 
 	try {
-		if (req.method === "GET" && req.url === "/api/config") {
+		const url = req.url.split("?")[0];
+		if (req.method === "GET" && url === "/api/config") {
 			await handleConfig(req, res);
-		} else if (req.method === "POST" && req.url.startsWith("/api/calls/")) {
+		} else if (req.method === "POST" && url.startsWith("/api/calls/")) {
 			await handleCallsProxy(req, res);
-		} else if (req.method === "POST" && req.url === "/api/register") {
+		} else if (req.method === "POST" && url === "/api/register") {
 			await handleRegister(req, res);
-		} else if (req.method === "POST" && req.url === "/api/leave") {
+		} else if (req.method === "POST" && url === "/api/leave") {
 			await handleLeave(req, res);
-		} else if (req.method === "GET" && req.url === "/api/map") {
+		} else if (req.method === "GET" && url === "/api/relay-pending") {
+			handleRelayPending(req, res);
+		} else if (req.method === "POST" && url === "/api/relay-answer") {
+			await handleRelayAnswer(req, res);
+		} else if (req.method === "GET" && url.startsWith("/api/relay-answer/")) {
+			handleGetRelayAnswer(req, res);
+		} else if (req.method === "GET" && url === "/api/relay-role") {
+			handleRelayRole(req, res);
+		} else if (req.method === "GET" && url === "/api/map") {
 			res.writeHead(200, { "Content-Type": "application/json" });
 			res.end(JSON.stringify(MAP));
 		} else if (req.method === "GET") {
-			// Serve static files from ../public (for local dev)
 			const publicDir = path.resolve(__dirname, "../../public");
-			let filePath = req.url === "/" ? "/index.html" : req.url;
+			let filePath = url === "/" ? "/index.html" : url;
 			const fullPath = path.join(publicDir, filePath);
 			const ext = path.extname(fullPath);
 			const mime = MIME_TYPES[ext] || "application/octet-stream";
@@ -210,7 +212,7 @@ const server = http.createServer(async (req, res) => {
 	}
 });
 
-// Returns connection config. Token is NOT exposed — client uses /api/calls/ proxy.
+// --- Config: returns player ID, bridge session, relay role ---
 async function handleConfig(req, res) {
 	if (!bridgeReady) {
 		res.writeHead(503);
@@ -221,100 +223,118 @@ async function handleConfig(req, res) {
 	const playerId = nextPlayerId++;
 	const inputChannelName = `input-${playerId}`;
 
+	// Assign relay role
+	const assignment = relayTree.assignRole(playerId);
+
 	res.writeHead(200, { "Content-Type": "application/json" });
-	res.end(
-		JSON.stringify({
-			playerId,
-			inputChannelName,
-			bridgeSessionId: bridge.sessionId,
-			map: MAP,
-		})
-	);
+	res.end(JSON.stringify({
+		playerId,
+		inputChannelName,
+		bridgeSessionId: bridge.sessionId,
+		relay: assignment, // { role: 'relay'|'leaf', relayParentId }
+		map: MAP,
+	}));
 }
 
-// Proxy Calls API requests — keeps the token server-side.
-// Client sends: POST /api/calls/sessions/new  (body forwarded as-is)
-// Server adds auth header and forwards to Cloudflare Calls API.
+// --- Calls API proxy ---
 async function handleCallsProxy(req, res) {
 	const callsPath = req.url.replace("/api/calls", "");
 	const body = await readBody(req);
-
 	const opts = {
 		method: "POST",
-		headers: {
-			Authorization: `Bearer ${CALLS_APP_TOKEN}`,
-		},
+		headers: { Authorization: `Bearer ${CALLS_APP_TOKEN}` },
 	};
 	if (body) {
 		opts.headers["Content-Type"] = "application/json";
-		opts.body = body; // Forward raw body
+		opts.body = body;
 	}
-
 	const resp = await fetch(`${CALLS_API}${callsPath}`, opts);
 	const data = await resp.text();
-
 	res.writeHead(resp.status, { "Content-Type": "application/json" });
 	res.end(data);
 }
 
-// Client calls this AFTER connecting and setting up channels
-// to register with the game server and have bridge subscribe to input
+// --- Register: player connected, set up input channel + P2P signaling ---
 async function handleRegister(req, res) {
 	const body = await readBody(req);
-	const { playerId, sessionId, inputChannelName } = JSON.parse(body);
+	const { playerId, sessionId, inputChannelName, p2pOffer } = JSON.parse(body);
 
 	world.addPlayer(playerId);
 	players.set(playerId, { sessionId, inputChannelName });
 
 	// Subscribe bridge to player's input channel
-	bridge.subscribeToPlayerInput(
-		sessionId,
-		inputChannelName,
-		playerId
-	).catch((e) => console.error("Bridge subscribe error:", e));
+	if (bridge) {
+		bridge.subscribeToPlayerInput(sessionId, inputChannelName, playerId)
+			.catch((e) => console.error("Bridge subscribe error:", e));
+	}
 
-	console.log(`Player ${playerId} registered (session: ${sessionId})`);
+	// If this is a leaf with a P2P offer, store it for the relay to pick up
+	const node = relayTree.getNode(playerId);
+	if (node && node.role === "leaf" && node.relayParentId && p2pOffer) {
+		relayTree.storeOffer(playerId, node.relayParentId, p2pOffer);
+	}
+
+	console.log(`Player ${playerId} registered (${node?.role || "unknown"}, session: ${sessionId})`);
 
 	res.writeHead(200, { "Content-Type": "application/json" });
 	res.end(JSON.stringify({ ok: true }));
 }
 
+// --- Leave ---
 async function handleLeave(req, res) {
 	const body = await readBody(req);
 	const { playerId } = JSON.parse(body);
-
 	const player = players.get(playerId);
 	if (player) {
 		world.removePlayer(playerId);
 		players.delete(playerId);
-		bridge.unsubscribePlayer(playerId);
+		if (bridge) bridge.unsubscribePlayer(playerId);
+		relayTree.removePlayer(playerId);
 		console.log(`Player ${playerId} left`);
 	}
-
 	res.writeHead(200, { "Content-Type": "application/json" });
 	res.end(JSON.stringify({ ok: true }));
 }
 
-// --- Helpers ---
-async function callsAPI(path, body, method = "POST") {
-	const opts = {
-		method,
-		headers: {
-			Authorization: `Bearer ${CALLS_APP_TOKEN}`,
-		},
-	};
-	if (body !== undefined && body !== null) {
-		opts.headers["Content-Type"] = "application/json";
-		opts.body = JSON.stringify(body);
-	}
-	const resp = await fetch(`${CALLS_API}${path}`, opts);
-	const data = await resp.json();
-	if (data.errorCode) {
-		throw new Error(`Calls API error: ${data.errorDescription}`);
-	}
-	return data;
+// --- Relay polls for new children's P2P offers ---
+function handleRelayPending(req, res) {
+	const url = new URL(req.url, `http://localhost`);
+	const relayId = parseInt(url.searchParams.get("relayId"));
+	const offers = relayTree.getPendingOffers(relayId);
+	res.writeHead(200, { "Content-Type": "application/json" });
+	res.end(JSON.stringify({ offers }));
 }
 
+// --- Relay sends P2P answer for a child ---
+async function handleRelayAnswer(req, res) {
+	const body = await readBody(req);
+	const { childId, answer } = JSON.parse(body);
+	relayTree.storeAnswer(childId, answer);
+	res.writeHead(200, { "Content-Type": "application/json" });
+	res.end(JSON.stringify({ ok: true }));
+}
+
+// --- Child polls for P2P answer from relay ---
+function handleGetRelayAnswer(req, res) {
+	const childId = parseInt(req.url.split("/").pop());
+	const answer = relayTree.getAnswer(childId);
+	res.writeHead(200, { "Content-Type": "application/json" });
+	res.end(JSON.stringify({ answer }));
+}
+
+// --- Child checks if role changed (orphan -> reassigned) ---
+function handleRelayRole(req, res) {
+	const url = new URL(req.url, `http://localhost`);
+	const playerId = parseInt(url.searchParams.get("playerId"));
+	const node = relayTree.getNode(playerId);
+	res.writeHead(200, { "Content-Type": "application/json" });
+	res.end(JSON.stringify({
+		role: node?.role || "unknown",
+		relayParentId: node?.relayParentId || null,
+	}));
+}
+
+// --- Helpers ---
 function readBody(req) {
 	return new Promise((resolve, reject) => {
 		let body = "";
@@ -325,12 +345,10 @@ function readBody(req) {
 }
 
 // --- Start ---
-// Start HTTP server immediately (container health check needs port 8080 listening)
 server.listen(PORT, () => {
 	console.log(`Game server listening on port ${PORT}`);
 });
 
-// Initialize bridge in background (retry on failure)
 async function startBridge(retries = 5) {
 	for (let i = 0; i < retries; i++) {
 		try {
@@ -340,13 +358,10 @@ async function startBridge(retries = 5) {
 		} catch (err) {
 			console.error(`Bridge init attempt ${i + 1}/${retries} failed:`, err.message);
 			console.error(err.stack);
-			if (i < retries - 1) {
-				await new Promise((r) => setTimeout(r, 3000));
-			}
+			if (i < retries - 1) await new Promise((r) => setTimeout(r, 3000));
 		}
 	}
 	console.error("Bridge failed to initialize after all retries");
 }
 
-// Delay bridge start to let container fully initialize
 setTimeout(() => startBridge(), 1000);
