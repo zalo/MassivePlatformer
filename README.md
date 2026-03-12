@@ -11,10 +11,10 @@ A massively multiplayer 2D side-scrolling platformer where hundreds of players a
 ┌──────────────────────────────────────────────────────────────┐
 │                                                              │
 │  Worker (edge)            Container (Firecracker VM)         │
-│  ┌──────────────┐        ┌──────────────────────────────┐    │
-│  │ Routes /api/* ├───────►│ Node.js game server          │    │
+│  ┌───────────────┐        ┌─────────────────────────────┐    │
+│  │ Routes /api/* ├───────►│ Node.js game server         │    │
 │  │ Serves static │        │ ┌────────┐ ┌──────┐ ┌─────┐ │    │
-│  └──────────────┘        │ │Physics │ │Bridge│ │Relay│ │    │
+│  └───────────────┘        │ │Physics │ │Bridge│ │Relay│ │    │
 │                           │ │ 45hz   │ │(SFU) │ │Tree │ │    │
 │                           │ └────────┘ └──┬───┘ └─────┘ │    │
 │                           └───────────────┼─────────────┘    │
@@ -22,7 +22,7 @@ A massively multiplayer 2D side-scrolling platformer where hundreds of players a
 │                        Realtime SFU       │                  │
 │                        ┌──────────────────┴──────┐           │
 │                        │  Anycast WebRTC CDN     │           │
-│                        └──┬──────────────┬───┬──┘           │
+│                        └──┬──────────────┬───┬───┘           │
 │                           │              │   │               │
 └───────────────────────────┼──────────────┼───┼───────────────┘
                             │              │   │
